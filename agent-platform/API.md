@@ -227,6 +227,9 @@
 查询参数（可选）：`status`、`agent_id`、`reviewer_id`、`workspace_id`。按 id 倒序。
 响应：`[{id, workspace_id, title, agent_id, creator_id, reviewer_id, status, priority, requirement, deliverable, review_comment, deadline, created_at, done_at, agent_name, creator_name, reviewer_name}, ...]`
 
+### GET /api/tasks/{id}
+按 ID 返回单项任务，字段与列表项一致；任务不存在返回 404。该端点用于外部 Agent 运行时按稳定 ID 拉取任务上下文。
+
 ### POST /api/tasks
 请求：
 ```json
@@ -239,6 +242,30 @@
   `"hint": "未指派数字员工，任务不会自动执行，建议到协作空间 @数字员工 派活"`。
 
 响应：任务对象（无 agent_id 时多一个 `hint` 字段）。
+
+### POST /api/tasks/{id}/external-events
+
+外部 Agent 执行控制面回传任务事件。仅 `boss/coach` 身份可调用；同一 `source + event_id` 幂等，重复请求返回 `idempotent: true`。
+
+请求：
+
+```json
+{
+  "event_id": "multica:JJ-18:deliverable:sha256",
+  "event_type": "deliverable",
+  "source": "multica",
+  "content": "## 外部 Agent 交付物\n...",
+  "metadata": {"external_issue_id": "...", "external_status": "done"}
+}
+```
+
+- `event_type`：`started/progress/blocked/deliverable/cancelled`；
+- `started/progress/blocked`：任务保持或进入 `进行中`，有工作区时写入 runtime_event 系统消息；
+- `deliverable`：`content` 必填，任务只进入 `待审核`，写入带 `runtime=external` 的交付卡片，**绝不自动通过**；
+- `cancelled`：任务进入 `已驳回`，保留原因等待人工处置；
+- 已经人工 `已通过` 的任务拒绝后续外部事件（409）。
+
+响应：`{"ok":true,"idempotent":false,"task":{...}}`。事件会写审计；`event_id/source/content/metadata` 格式错误返回 400。
 
 ### POST /api/tasks/{id}/review
 人工审核（仅 `待审核` 状态可审，审核人记为当前登录人）。
@@ -263,6 +290,7 @@
 - `reject`：状态→`已驳回` 并记录批注，随后数字员工自动重做一轮：新交付物开头注入
   `第 N 版修订说明：针对上一轮驳回意见『<comment>』……`，状态回到 `待审核`，
   工作区再发 deliverable（payload 含 `rework: true, version: N`）+ approval 两条消息。
+  若最新交付卡片带 `runtime=external`，则保持 `已驳回` 并写 runtime_event，等待外部运行时读取任务状态后重做，避免本地模板覆盖真实 Agent 结果。
 
 响应：更新后的任务对象。400 action 非法 / 状态非待审核；403 权限不足或自审；404 任务不存在。
 

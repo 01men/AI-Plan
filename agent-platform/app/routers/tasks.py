@@ -1,4 +1,7 @@
 """任务：查询/创建/人工审核（人在环路）"""
+import json
+import re
+import sqlite3
 from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -21,6 +24,17 @@ def _get_task_or_404(conn, tid):
     if not row:
         raise HTTPException(404, "任务不存在")
     return row
+
+
+def _detail(conn, tid):
+    row = conn.execute(
+        "SELECT t.*,a.name agent_name,c.name creator_name,r.name reviewer_name "
+        "FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id "
+        "LEFT JOIN people c ON c.id=t.creator_id LEFT JOIN people r ON r.id=t.reviewer_id "
+        "WHERE t.id=?", (tid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "任务不存在")
+    return dict(row)
 
 
 @router.get("")
@@ -47,6 +61,12 @@ def list_tasks(status: str = None, agent_id: int = None, reviewer_id: int = None
         sql += " WHERE " + " AND ".join(cond)
     sql += " ORDER BY t.id DESC"
     return [_view(r) for r in conn.execute(sql, args)]
+
+
+@router.get("/{tid}")
+def get_task(tid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
+    """按 ID 读取单项任务，供外部 Agent 运行时使用。"""
+    return _detail(conn, tid)
 
 
 @router.post("")
@@ -95,6 +115,100 @@ def create_task(body: dict = Body(...), conn=Depends(db_conn), person=Depends(ge
                             f"（审核人：{engine._person_name(conn, reviewer)}）。")
     conn.commit()
     return _view(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+
+
+@router.post("/{tid}/external-events")
+def external_event(tid: int, body: dict = Body(...), conn=Depends(db_conn),
+                   person=Depends(get_current_person)):
+    """外部执行控制面回传事件；任何交付物都只进入“待审核”。"""
+    if person["tier"] not in ("boss", "coach"):
+        raise HTTPException(403, "仅高管或教练团身份可回传外部运行时事件")
+    task = _get_task_or_404(conn, tid)
+    if task["status"] == "已通过":
+        raise HTTPException(409, "任务已经人工审核通过，不能再写入外部事件")
+    event_type = str(body.get("event_type") or "").strip().lower()
+    if event_type not in ("started", "progress", "blocked", "deliverable", "cancelled"):
+        raise HTTPException(400, "event_type 仅支持 started/progress/blocked/deliverable/cancelled")
+    event_id = str(body.get("event_id") or "").strip()
+    source = str(body.get("source") or "external-runtime").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", event_id):
+        raise HTTPException(400, "event_id 仅允许 1-128 位字母、数字、点、下划线、冒号或短横线")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", source):
+        raise HTTPException(400, "source 格式不合法")
+    content = str(body.get("content") or "").strip()
+    if len(content) > 20000:
+        raise HTTPException(400, "content 不能超过 20000 字符")
+    metadata = body.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise HTTPException(400, "metadata 必须是对象")
+    event_key = f"runtime-event:{source}:{event_id}"
+    try:
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
+                     (event_key, datetime.now().isoformat(timespec="seconds")))
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"ok": True, "idempotent": True, "task": _detail(conn, tid)}
+
+    payload = {"task_id": tid, "runtime": "external", "source": source,
+               "external_event_id": event_id, "metadata": metadata}
+    if event_type == "started":
+        conn.execute("UPDATE tasks SET status='进行中',deliverable=NULL,done_at=NULL WHERE id=?",
+                     (tid,))
+        message = content or f"任务 #{tid} 已进入 {source} 执行队列。"
+    elif event_type == "progress":
+        conn.execute("UPDATE tasks SET status='进行中' WHERE id=?", (tid,))
+        message = content or f"任务 #{tid} 外部执行进度已更新。"
+    elif event_type == "blocked":
+        conn.execute("UPDATE tasks SET status='进行中' WHERE id=?", (tid,))
+        message = content or f"任务 #{tid} 外部执行受阻，请人工处理。"
+    elif event_type == "cancelled":
+        message = content or f"任务 #{tid} 外部执行已取消。"
+        conn.execute("UPDATE tasks SET status='已驳回',review_comment=? WHERE id=?",
+                     (message, tid))
+    else:
+        if not content:
+            raise HTTPException(400, "deliverable 事件必须包含 content")
+        reviewer = task["reviewer_id"] or engine._pick_reviewer(
+            conn, task["workspace_id"], task["creator_id"])
+        conn.execute("UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=? WHERE id=?",
+                     (content, reviewer, tid))
+        message = f"{source} 已完成任务 #{tid}，交付物已进入人工审核。"
+        if task["workspace_id"]:
+            version = engine._deliverable_version(conn, tid, task["workspace_id"])
+            agent = conn.execute("SELECT * FROM agents WHERE id=?", (task["agent_id"],)).fetchone()
+            if agent:
+                engine._add_message(conn, task["workspace_id"], "agent", agent["id"], agent["name"],
+                                    "agent", "deliverable", content,
+                                    {**payload, "status": "待审核", "version": version})
+            engine._add_message(
+                conn, task["workspace_id"], "system", None, "系统", "agent", "approval",
+                f"{message}审核人：{engine._person_name(conn, reviewer)}。", payload)
+
+    if task["workspace_id"] and event_type != "deliverable":
+        engine._add_message(conn, task["workspace_id"], "system", None, "系统", "agent",
+                            "runtime_event", message, payload)
+    conn.execute(
+        "INSERT INTO audits(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)",
+        (person["name"], "外部运行时事件", f"任务#{tid}",
+         json.dumps({"event_type": event_type, "source": source, "event_id": event_id},
+                    ensure_ascii=False), datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    return {"ok": True, "idempotent": False, "task": _detail(conn, tid)}
+
+
+def _latest_deliverable_is_external(conn, task):
+    if not task["workspace_id"]:
+        return False
+    row = conn.execute(
+        "SELECT payload FROM messages WHERE workspace_id=? AND msg_type='deliverable' "
+        "AND payload LIKE ? ORDER BY id DESC LIMIT 1",
+        (task["workspace_id"], f'%"task_id": {task["id"]}%')).fetchone()
+    if not row or not row["payload"]:
+        return False
+    try:
+        return json.loads(row["payload"]).get("runtime") == "external"
+    except (TypeError, json.JSONDecodeError):
+        return False
 
 
 @router.post("/{tid}/review")
@@ -147,7 +261,14 @@ def review_task(tid: int, body: dict = Body(...), conn=Depends(db_conn),
                      (comment, person["id"], tid))
         conn.commit()
         audit(conn, person["name"], "审核驳回", f"任务#{tid}", comment)
-        if task["agent_id"]:  # 触发数字员工重做一轮：新交付物，状态回待审核
-            engine.rework(conn, tid)
+        if task["agent_id"]:
+            if _latest_deliverable_is_external(conn, task):
+                if task["workspace_id"]:
+                    engine._add_message(
+                        conn, task["workspace_id"], "system", None, "系统", "agent", "runtime_event",
+                        f"任务 #{tid} 的外部交付物已驳回，等待外部 Agent 按意见重做。",
+                        {"task_id": tid, "runtime": "external", "review_comment": comment})
+            else:  # 原有本地任务仍由本地执行引擎自动重做
+                engine.rework(conn, tid)
             conn.commit()
     return _view(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())

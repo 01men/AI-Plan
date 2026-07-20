@@ -48,14 +48,18 @@ def create_incentive(body: dict = Body(...), conn=Depends(db_conn),
     if itype not in INCENTIVE_TYPES:
         raise HTTPException(422, "奖项类型仅允许：火花奖/银齿轮奖/金扳手奖/种子基金")
     amount = body.get("amount", 0)
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"金额格式不正确：{amount}")
     if itype in INCENTIVE_AMOUNT_RANGE:
         lo, hi = INCENTIVE_AMOUNT_RANGE[itype]
-        try:
-            amount = float(amount)
-        except (TypeError, ValueError):
-            raise HTTPException(422, f"金额格式不正确：{amount}")
         if not (lo <= amount <= hi):
             raise HTTPException(422, f"{itype}申报金额须在 {lo:.0f}-{hi:.0f} 元之间，当前 {amount:.0f} 元超出档位")
+    elif itype == "种子基金":
+        # 种子基金从降本增效提取，纳入年度激励池（10 万元）管理，须为正且不超过池上限
+        if not (0 < amount <= 100000):
+            raise HTTPException(422, f"种子基金申报金额须在 1-100000 元之间（年度激励池上限 10 万元），当前 {amount:.0f} 元超出范围")
     iid = conn.execute(
         "INSERT INTO incentives(type,nominee,reason,amount,status,created_at) VALUES(?,?,?,?,?,?)",
         (itype, nominee, body.get("reason", ""), amount,

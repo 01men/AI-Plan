@@ -8,6 +8,11 @@ agent-platform/data/*.db-journal
 agent-platform/data/*.db-wal
 agent-platform/data/*.db-shm
 agent-platform/data/*.log
+multica-platform/data/*.db
+multica-platform/data/*.db-journal
+multica-platform/data/*.db-wal
+multica-platform/data/*.db-shm
+multica-platform/data/*.log
 
 # 验收截图（报告 md 保留，图片不入库）
 agent-platform/acceptance/shots/
