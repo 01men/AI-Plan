@@ -166,6 +166,25 @@ details[open] .tree-arrow { transform: rotate(90deg); }
 .chart-box { width: 100%; height: 300px; }
 .chart-box-sm { width: 100%; height: 180px; }
 
+/* ---------- 视图顶部人话说明条 ---------- */
+.view-hint { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; padding: .55rem .9rem;
+  background: linear-gradient(90deg, rgba(44,82,130,.06), rgba(49,151,149,.06));
+  border: 1px solid #e2e8f0; border-radius: .6rem; color: #475569; font-size: .82rem; }
+.view-hint svg { color: #319795; }
+
+/* ---------- 禁用按钮 ---------- */
+.btn-success-sm:disabled, .btn-danger-sm:disabled { opacity: .4; cursor: not-allowed; }
+.btn-success-sm:disabled:hover, .btn-danger-sm:disabled:hover { filter: none; }
+
+/* ---------- 窄屏适配（<1100px 侧边栏可折叠） ---------- */
+#btn-menu { display: none; }
+@media (max-width: 1100px) {
+  #btn-menu { display: inline-flex; align-items: center; }
+  #app-view > aside { transform: translateX(-100%); transition: transform .25s ease; }
+  #app-view.sidebar-open > aside { transform: translateX(0); }
+  #app-view > .ml-60 { margin-left: 0; }
+}
+
 /* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: #f1f5f9; }

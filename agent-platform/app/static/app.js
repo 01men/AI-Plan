@@ -21,9 +21,9 @@ const LEVEL_META = { L1: 'bg-success', L2: 'bg-secondary', L3: 'bg-accent', L4: 
 const INCENTIVE_META = { '火花奖': 'bg-accent', '银齿轮奖': 'bg-gray-400', '金扳手奖': 'badge-gold', '种子基金': 'bg-teal' };
 const SCENARIO_STATUS_META = { '待立项': 'bg-gray-400', '已立项': 'bg-secondary', '开发中': 'bg-accent', '试点中': 'bg-teal', '已验收': 'bg-success', '已下线': 'bg-danger' };
 const ZONE_META = {
-  discussion: { name: '讨论区',       desc: '人与数字员工公开研讨，工作区全员可见。' },
-  agent:      { name: 'Agent 执行区', desc: '在此区发言或 @数字员工 即自动派发任务，交付物在此接受人工审核。' },
-  private:    { name: '私聊打磨区',   desc: '与数字员工一对一打磨需求与提示词，轻量交流、不扰动正式任务流。' },
+  discussion: { name: '讨论区',       desc: '和同事讨论，AI 不打扰', ph: '和同事聊聊想法……（AI 不会在这里插话）' },
+  agent:      { name: 'Agent 执行区', desc: '@数字员工 直接派活，它干完你检查', ph: '@数字员工 + 说人话描述任务，如：整理本周订单资料并生成唛头' },
+  private:    { name: '私聊打磨区',   desc: '先和 AI 助手一对一理清需求（它只回建议不干活），想清楚了再去执行区派活', ph: '把想法说给 AI 助手听，它帮你理成任务草稿（不会派活）' },
 };
 const TASK_COLUMNS = ['待处理', '进行中', '待审核', '已通过', '已驳回'];
 const TASK_STATUS_META = { '待处理': 'bg-gray-400', '进行中': 'bg-secondary', '待审核': 'bg-accent', '已通过': 'bg-success', '已驳回': 'bg-danger' };
@@ -180,8 +180,21 @@ const VIEWS = [
   { key: 'governance', name: '治理中心',   render: renderGovernance },
   { key: 'roadmap',    name: '路线图',     render: renderRoadmap },
 ];
+/* 每个视图顶部的一行人话说明（低学习门槛） */
+const VIEW_HINTS = {
+  dashboard:  '全公司 AI 推进情况一目了然',
+  workspaces: '在这里跟数字员工说话、派活、收结果',
+  agents:     '你的 AI 同事花名册',
+  scenarios:  '想让 AI 干什么活，从这里提',
+  tasks:      '数字员工干的活，在这里检查和确认',
+  skills:     '好用的 AI 话术和本领，沉淀在这里大家复用',
+  knowledge:  '公司的文件资料柜（NAS）',
+  org:        '看看同事和数字员工都在哪个部门',
+  governance: '奖励申请、AI 费用报销、操作记录',
+  roadmap:    '今年的推进计划',
+};
 function currentViewKey() {
-  const h = (location.hash || '').replace(/^#\/?/, '');
+  const h = (location.hash || '').replace(/^#\/?/, '').split('/')[0];
   return VIEWS.some(function (v) { return v.key === h; }) ? h : 'dashboard';
 }
 function buildSidebar() {
@@ -221,8 +234,10 @@ function makeChart(domId) {
   charts.push(c);
   return c;
 }
+let routeSeq = 0;                  // 路由序号：防止 hashchange 与直接调用并发导致说明条重复
 async function route() {
   if (!state.person) return;
+  const seq = ++routeSeq;
   disposeCharts();
   closeDrawer();
   const key = currentViewKey();
@@ -231,9 +246,18 @@ async function route() {
     n.classList.toggle('active', n.dataset.view === key);
   });
   document.getElementById('topbar-title').textContent = view.name;
+  document.getElementById('app-view').classList.remove('sidebar-open');
   const c = document.getElementById('view-container');
   try {
     await view.render(c);
+    if (seq !== routeSeq) return;   // 渲染期间又触发了新路由，放弃本次插入
+    if (VIEW_HINTS[key]) {
+      c.querySelectorAll('.view-hint').forEach(function (el) { el.remove(); });
+      const hint = document.createElement('div');
+      hint.className = 'view-hint';
+      hint.innerHTML = '<svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span>' + esc(VIEW_HINTS[key]) + '</span>';
+      c.insertBefore(hint, c.firstChild);
+    }
   } catch (e) {
     c.innerHTML = errorHtml(e.message);
     toast(e.message, 'error');
@@ -241,6 +265,13 @@ async function route() {
 }
 
 /* ==================== 登录 / 退出 ==================== */
+const TIER_LOGIN_HINT = {
+  boss:      '进去后看「驾驶舱」，全公司 AI 进展和投入产出都在这里',
+  coach:     '进去后到「任务中心」审核交付物，到「治理中心」复核费用报销',
+  backbone:  '进去后到「任务中心」勾选"只看待我审核"，给数字员工的活把关',
+  developer: '进去后到「数字员工」维护档案，到「协作空间」调试派活',
+  staff:     '进去后点「协作空间」，找你的数字员工聊天派活',
+};
 async function bootLogin() {
   const box = document.getElementById('login-people');
   box.innerHTML = '<div class="text-gray-300 flex items-center space-x-2"><span class="spinner"></span><span>正在加载组织人员…</span></div>';
@@ -251,9 +282,10 @@ async function bootLogin() {
       const group = people.filter(function (p) { return p.tier === tier; });
       if (!group.length) return;
       const meta = TIER_META[tier];
-      html += '<div class="mb-7"><div class="flex items-center space-x-2 mb-3">' +
+      html += '<div class="mb-7"><div class="flex items-center space-x-2 mb-1.5">' +
         '<span class="badge ' + meta.badge + '">' + meta.label + '</span>' +
         '<span class="text-gray-400 text-xs">' + group.length + ' 人</span></div>' +
+        (TIER_LOGIN_HINT[tier] ? '<div class="text-gray-300 text-xs mb-2.5">▸ ' + esc(TIER_LOGIN_HINT[tier]) + '</div>' : '') +
         '<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">';
       group.forEach(function (p) {
         html += '<div class="person-card border ' + meta.cardRing + '" onclick="doLogin(' + p.id + ')">' +
@@ -286,7 +318,11 @@ function enterApp() {
   document.getElementById('app-view').classList.remove('hidden');
   renderSidebarUser();
   renderTopbarUser();
-  if (!location.hash) location.hash = '#/dashboard';
+  if (!location.hash) {
+    // staff 默认落协作空间；设置 hash 会触发 hashchange → route()，无需重复调用
+    location.hash = (state.person && state.person.tier === 'staff') ? '#/workspaces' : '#/dashboard';
+    return;
+  }
   route();
 }
 function doLogout() {
@@ -324,25 +360,31 @@ async function renderDashboard(c) {
   c.innerHTML = skeletonHtml(5);
   const d = await api('/api/metrics/dashboard');
   const k = d.kpi || {};
+  /* kpi 每项为 {value, note} 结构（note 为口径说明） */
+  const kval = function (x) { return (x && typeof x === 'object') ? (x.value ?? 0) : (x ?? 0); };
+  const knote = function (x) { return (x && typeof x === 'object' && x.note) ? x.note : ''; };
   const kpis = [
-    { label: '场景覆盖率',     v: (k.coverage ?? 0) + '%',        sub: '目标 ≥70%',   color: 'text-secondary' },
-    { label: '验收通过率',     v: (k.acceptance_rate ?? 0) + '%', sub: '目标 ≥85%',   color: 'text-success' },
-    { label: '活跃使用率(7日)', v: (k.active_rate ?? 0) + '%',     sub: '目标 ≥60%',   color: 'text-teal' },
-    { label: '累计节省工时',   v: fmtNum(k.hours_saved) + ' h',   sub: '数字员工产出', color: 'text-accent' },
-    { label: '交付准确率',     v: (k.accuracy ?? 0) + '%',        sub: '目标 ≥95%',   color: 'text-secondary' },
-    { label: '年化综合收益',   v: '¥' + fmtWan(k.annual_benefit), sub: '目标 ¥79万',  color: 'text-success' },
-    { label: 'Skill 复用数',   v: fmtNum(k.reuse_count),          sub: '被引用去重',   color: 'text-primary' },
+    { label: '试点覆盖率',     v: kval(k.trial_coverage) + '%', sub: '试点中+已验收场景占比', color: 'text-secondary', note: knote(k.trial_coverage) },
+    { label: '验收覆盖率',     v: kval(k.coverage) + '%',       sub: '方案口径 · 目标 ≥70%',  color: 'text-gray-500',  note: knote(k.coverage) },
+    { label: '验收通过率',     v: kval(k.acceptance_rate) + '%', sub: '目标 ≥85%',            color: 'text-success',   note: knote(k.acceptance_rate) },
+    { label: '活跃使用率(7日)', v: kval(k.active_rate) + '%',    sub: '目标 ≥60%',            color: 'text-teal',      note: knote(k.active_rate) },
+    { label: '累计节省工时',   v: fmtNum(kval(k.hours_saved)) + ' h',   sub: '数字员工产出',   color: 'text-accent',    note: knote(k.hours_saved) },
+    { label: '交付准确率',     v: kval(k.accuracy) + '%',       sub: '目标 ≥95%',             color: 'text-secondary', note: knote(k.accuracy) },
+    { label: '年化综合收益',   v: '¥' + fmtWan(kval(k.annual_benefit)), sub: '目标 ¥79万',     color: 'text-success',   note: knote(k.annual_benefit) },
+    { label: 'Skill 复用数',   v: fmtNum(kval(k.reuse_count)),  sub: '被引用去重',            color: 'text-primary',   note: knote(k.reuse_count) },
   ];
-  const inv = d.investment || { year1: 0, breakdown: {} };
+  const inv = d.investment || { year1: 0, breakdown: {}, breakdown_detail: {} };
   const ben = d.benefit || { direct: 0, total: 0 };
   const maxMoney = Math.max(ben.total || 1, 1);
 
   let html = '<div class="space-y-5">';
-  /* ① 七维 KPI */
-  html += '<div class="grid grid-cols-4 xl:grid-cols-7 gap-3">' + kpis.map(function (x) {
+  /* ① 八维 KPI（覆盖率双口径） */
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-3">' + kpis.map(function (x) {
     return '<div class="data-card !p-4 card-hover"><div class="text-xs text-gray-500">' + x.label + '</div>' +
       '<div class="text-2xl font-black mt-1 ' + x.color + '">' + x.v + '</div>' +
-      '<div class="text-xs text-gray-400 mt-1">' + x.sub + '</div></div>';
+      '<div class="text-xs text-gray-400 mt-1">' + x.sub + '</div>' +
+      (x.note ? '<div class="text-[11px] text-gray-400 mt-1 pt-1 border-t border-gray-50">口径：' + esc(x.note) + '</div>' : '') +
+      '</div>';
   }).join('') + '</div>';
 
   html += '<div class="grid grid-cols-1 xl:grid-cols-3 gap-5">';
@@ -355,9 +397,21 @@ async function renderDashboard(c) {
       moneyBar('直接收益', ben.direct, maxMoney, '#319795') +
       moneyBar('综合收益', ben.total, maxMoney, '#ed8936') +
     '</div>' +
+    ((ben.roi_year1_pct != null || ben.roi_year2_pct != null)
+      ? '<div class="mt-3 flex flex-wrap gap-1.5">' +
+        (ben.roi_year1_pct != null ? '<span class="badge badge-outline !text-secondary !border-secondary/40">首年净 ROI ' + ben.roi_year1_pct + '%</span>' : '') +
+        (ben.roi_year2_pct != null ? '<span class="badge badge-outline !text-teal !border-teal/40">次年净 ROI ' + ben.roi_year2_pct + '%</span>' : '') +
+        '</div>' : '') +
     '<div class="mt-4 pt-3 border-t border-gray-100"><div class="text-xs text-gray-500 mb-2">投入构成</div>' +
     Object.keys(inv.breakdown || {}).map(function (name) {
-      return '<div class="flex justify-between text-xs text-gray-600 py-0.5"><span>' + esc(name) + '</span><span class="font-medium">¥' + fmtWan(inv.breakdown[name]) + '</span></div>';
+      const detail = (inv.breakdown_detail || {})[name] || {};
+      const detailKeys = Object.keys(detail);
+      return '<div class="flex justify-between text-xs text-gray-600 py-0.5"><span>' + esc(name) + '</span><span class="font-medium">¥' + fmtWan(inv.breakdown[name]) + '</span></div>' +
+        (detailKeys.length
+          ? '<div class="pl-3 pb-1">' + detailKeys.map(function (dk) {
+              return '<div class="flex justify-between text-[11px] text-gray-400 py-px"><span>· ' + esc(dk) + '</span><span>¥' + fmtWan(detail[dk]) + '</span></div>';
+            }).join('') + '</div>'
+          : '');
     }).join('') + '</div></div>';
   /* ③ 近 14 天趋势 */
   html += '<div class="data-card xl:col-span-2"><h3 class="font-bold text-primary mb-2">近 14 天任务完成与节省工时</h3><div id="chart-trend" class="chart-box"></div></div>';
@@ -384,6 +438,7 @@ async function renderDashboard(c) {
             '<span class="font-bold text-gray-700">' + esc(m.sender_name) + '</span>' +
             '<span class="badge badge-outline">' + esc(m.workspace_name || '') + '</span>' +
             (isReport ? '<span class="badge bg-accent">日报</span>' : '') +
+            (isReport && m.workspace_id ? '<span class="text-xs text-accent font-bold cursor-pointer hover:underline" onclick="gotoWorkspaceZone(' + m.workspace_id + ',\'agent\')">查看日报 →</span>' : '') +
             '<span>' + fmtTime(m.created_at) + '</span></div>' +
           '<div class="' + (isReport ? 'max-h-48 overflow-y-auto' : '') + '">' + mdLite(m.content) + '</div>' +
         '</div></div>';
@@ -457,6 +512,13 @@ async function renderWorkspaces(c) {
   c.innerHTML = loadingHtml('加载工作区…');
   const list = await api('/api/workspaces');
   await ensureAgentsCache();
+  /* 支持深链 #/workspaces/<id>/<zone>（如驾驶舱"查看日报"跳转） */
+  const parts = (location.hash || '').replace(/^#\/?/, '').split('/');
+  if (parts[0] === 'workspaces') {
+    const wid = Number(parts[1]);
+    if (wid && list.some(function (w) { return w.id === wid; })) wsState.id = wid;
+    if (parts[2] && ZONE_META[parts[2]]) wsState.zone = parts[2];
+  }
   if (!wsState.id || !list.some(function (w) { return w.id === wsState.id; })) {
     wsState.id = list.length ? list[0].id : null;
   }
@@ -485,6 +547,14 @@ async function selectWorkspace(id) {
   wsState.id = id;
   await renderWorkspaces(document.getElementById('view-container'));
 }
+/* 从驾驶舱动态流等入口跳转到指定工作区的指定分区（深链，hashchange 触发渲染） */
+function gotoWorkspaceZone(wsId, zone) {
+  wsState.id = wsId;
+  wsState.zone = zone || 'discussion';
+  const target = '#/workspaces/' + wsId + '/' + wsState.zone;
+  if (location.hash === target) route();
+  else location.hash = target;
+}
 async function loadWorkspacePanel() {
   const panel = document.getElementById('ws-panel');
   if (!panel) return;
@@ -503,14 +573,14 @@ async function loadWorkspacePanel() {
       return '<div class="zone-tab ' + (key === wsState.zone ? 'active' : '') + '" onclick="switchZone(\'' + key + '\')">' + ZONE_META[key].name + '</div>';
     }).join('') +
     '</div></div>' +
-    '<div class="px-4 py-1.5 bg-teal/5 text-xs text-teal border-b border-gray-100 shrink-0">AI 原生三区模型 · ' + esc(z.name) + '：' + esc(z.desc) + '</div>' +
+    '<div class="px-4 py-1.5 bg-teal/5 text-xs text-teal border-b border-gray-100 shrink-0">💡 ' + esc(z.name) + '：' + esc(z.desc) + '</div>' +
     '<div id="msg-list" class="flex-1 overflow-y-auto chat-scroll px-4 py-3 bg-gray-50/50"></div>' +
     /* 输入区 */
     '<div class="p-3 border-t border-gray-100 shrink-0 relative">' +
       '<div id="at-popup" class="at-popup hidden"></div>' +
       '<div id="dispatch-hint" class="hidden text-xs text-accent font-medium mb-1.5">⚡ 将派发任务给数字员工执行</div>' +
       '<div class="flex items-end space-x-2">' +
-        '<textarea id="ws-input" class="form-textarea flex-1" rows="2" placeholder="输入消息，@ 可唤起数字员工候选；Enter 发送，Shift+Enter 换行"></textarea>' +
+        '<textarea id="ws-input" class="form-textarea flex-1" rows="2" placeholder="' + esc(z.ph || '输入消息，Enter 发送') + '"></textarea>' +
         '<button class="btn-primary shrink-0" onclick="sendWsMessage()">发送</button>' +
       '</div></div>';
   panel.innerHTML = html;
@@ -576,6 +646,8 @@ function deliverableHtml(m, t) {
       '<div class="flex items-center justify-between flex-wrap gap-1">' +
         '<div class="flex items-center space-x-2"><span class="font-bold text-primary text-sm">交付卡片</span>' +
         '<span class="text-xs text-gray-500">' + esc(m.sender_name) + '</span>' +
+        (p.version ? '<span class="badge bg-secondary">v' + p.version + '</span>' : '') +
+        (p.rework ? '<span class="badge bg-accent">按驳回意见修订</span>' : '') +
         (p.status ? statusBadge(p.status, TASK_STATUS_META) : '') + '</div>' +
         '<span class="text-xs text-gray-400">任务 #' + (p.task_id ?? '-') + ' · ' + t + '</span></div>' +
       '<div class="deliverable-body mt-2">' + mdLite(m.content) + '</div>' +
@@ -882,21 +954,37 @@ async function submitScenario() {
 }
 
 /* ==================== 视图 5：任务中心 ==================== */
+const taskState = { onlyMine: false };
+function toggleTaskOnlyMine(v) {
+  taskState.onlyMine = v;
+  renderTasks(document.getElementById('view-container'));
+}
 async function renderTasks(c) {
   c.innerHTML = loadingHtml('加载任务…');
   taskCache = await api('/api/tasks');
+  const myId = state.person ? state.person.id : null;
+  const shown = (taskState.onlyMine && myId)
+    ? taskCache.filter(function (t) { return t.status === '待审核' && t.reviewer_id === myId; })
+    : taskCache;
   const cols = {};
   TASK_COLUMNS.forEach(function (s) { cols[s] = []; });
-  taskCache.forEach(function (t) { if (cols[t.status]) cols[t.status].push(t); });
+  shown.forEach(function (t) { if (cols[t.status]) cols[t.status].push(t); });
   const now = Date.now();
-  let html = '<div class="flex gap-4 overflow-x-auto pb-3">';
+  let html = '<div class="flex items-center justify-between flex-wrap gap-2 mb-3">' +
+    '<label class="inline-flex items-center gap-2 text-sm text-gray-600 cursor-pointer bg-white border border-gray-200 rounded-lg px-3 py-1.5 shadow-sm">' +
+      '<input type="checkbox" ' + (taskState.onlyMine ? 'checked' : '') + ' onchange="toggleTaskOnlyMine(this.checked)" class="accent-secondary">只看待我审核</label>' +
+    '<button class="btn-primary" onclick="openTaskModal()">+ 新建任务</button></div>';
+  html += '<div class="flex gap-4 overflow-x-auto pb-3">';
   TASK_COLUMNS.forEach(function (s) {
     const items = cols[s];
     html += '<div class="kanban-col"><div class="px-3 py-2.5 border-b border-gray-100 flex items-center justify-between shrink-0">' +
       '<span class="flex items-center gap-1.5">' + statusBadge(s, TASK_STATUS_META) + '</span>' +
       '<span class="text-xs text-gray-400 font-bold">' + items.length + '</span></div>' +
       '<div class="kanban-cards">';
-    if (!items.length) html += '<div class="text-center text-xs text-gray-300 py-6">暂无任务</div>';
+    if (!items.length) {
+      html += '<div class="text-center text-xs text-gray-400 py-6 px-2">' +
+        (taskState.onlyMine ? '没有待你审核的任务，去协作空间 @数字员工 派一个吧' : '还没有任务，去协作空间 @数字员工 派一个吧') + '</div>';
+    }
     items.forEach(function (t) {
       let deadlineCls = 'text-gray-400';
       if (t.deadline && t.status !== '已通过' && t.status !== '已驳回') {
@@ -919,6 +1007,38 @@ async function renderTasks(c) {
   });
   html += '</div>';
   c.innerHTML = html;
+}
+async function openTaskModal() {
+  await ensureAgentsCache();
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">新建任务</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">指派数字员工后会立即执行并产出交付物；不指派则保持待处理。</p>' +
+    '<div class="space-y-3">' +
+      '<div><label class="form-label">任务标题 *</label><input id="nt-title" class="form-input" placeholder="如：整理8月展会客户名单"></div>' +
+      '<div class="grid grid-cols-2 gap-3">' +
+        '<div><label class="form-label">数字员工（可选）</label><select id="nt-agent" class="form-select">' +
+          '<option value="">暂不指派</option>' +
+          (cache.agents || []).map(function (a) { return '<option value="' + a.id + '">' + esc(a.name) + '</option>'; }).join('') + '</select></div>' +
+        '<div><label class="form-label">优先级</label><select id="nt-priority" class="form-select"><option>高</option><option selected>中</option><option>低</option></select></div></div>' +
+    '</div>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitTask()">创建</button></div>');
+}
+async function submitTask() {
+  const body = {
+    title: document.getElementById('nt-title').value.trim(),
+    priority: document.getElementById('nt-priority').value,
+  };
+  const agentId = Number(document.getElementById('nt-agent').value);
+  if (agentId) body.agent_id = agentId;
+  if (!body.title) { toast('请填写任务标题', 'error'); return; }
+  try {
+    const r = await postApi('/api/tasks', body);
+    closeModal();
+    if (r && r.hint) toast(r.hint, 'info');
+    else toast(agentId ? '任务已创建，数字员工已完成执行，待审核' : '任务已创建');
+    renderTasks(document.getElementById('view-container'));
+  } catch (e) { toast(e.message, 'error'); }
 }
 function openTaskReviewModal(id) {
   const t = taskCache.find(function (x) { return x.id === id; });
@@ -962,13 +1082,18 @@ async function renderSkills(c) {
   const list = await api('/api/skills');
   const scopes = ['公开', '组织', '个人'];
   const scopeMeta = { '公开': 'bg-success', '组织': 'bg-secondary', '个人': 'bg-accent' };
+  const scopeEmpty = {
+    '公开': '暂无公开 Skill',
+    '组织': '暂无组织级 Skill，好用的团队话术可以沉淀到这里',
+    '个人': '还没有个人技能，把你常用的 AI 话术沉淀到这里',
+  };
   let html = '';
   scopes.forEach(function (sc) {
     const items = list.filter(function (s) { return s.scope === sc; });
     html += '<div class="mb-6"><div class="flex items-center space-x-2 mb-3">' +
       '<span class="badge ' + scopeMeta[sc] + '">' + sc + '</span>' +
       '<span class="text-sm text-gray-500">共 ' + items.length + ' 个 Skill</span></div>';
-    if (!items.length) html += '<div class="data-card">' + emptyHtml('该范围暂无 Skill') + '</div>';
+    if (!items.length) html += '<div class="data-card">' + emptyHtml(scopeEmpty[sc] || '该范围暂无 Skill') + '</div>';
     else {
       html += '<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">' + items.map(function (s) {
         return '<div class="data-card !p-4 card-hover">' +
@@ -1017,7 +1142,7 @@ async function loadSpaceDocs() {
   const box = document.getElementById('docs-box');
   if (!box) return;
   const docs = await api('/api/knowledge/documents?space_id=' + knState.spaceId);
-  if (!docs.length) { box.innerHTML = emptyHtml('该空间暂无文档，点击右上角登记'); return; }
+  if (!docs.length) { box.innerHTML = emptyHtml('这个资料柜还是空的，点右上角「登记文档」把公司文件放进来'); return; }
   box.innerHTML = '<div class="overflow-x-auto"><table class="gov-table w-full"><thead><tr>' +
     '<th>标题</th><th>密级</th><th>标签</th><th>上传人</th><th>时间</th></tr></thead><tbody>' +
     docs.map(function (d) {
@@ -1083,7 +1208,8 @@ async function renderOrg(c) {
         '<div class="flex flex-wrap gap-1.5 mb-2">';
       (d.people || []).forEach(function (pp) {
         html += '<span class="inline-flex items-center gap-1 bg-gray-50 border border-gray-200 rounded-full px-2.5 py-1 text-xs">' +
-          '<b>' + esc(pp.name) + '</b><span class="text-gray-400">' + esc(pp.role_title || '') + '</span>' + tierBadge(pp.tier) + '</span>';
+          '<b>' + esc(pp.name) + '</b><span class="text-gray-400">' + esc(pp.role_title || '') + '</span>' + tierBadge(pp.tier) +
+          (pp.direction ? '<span class="text-gray-400">· ' + esc(pp.direction) + '</span>' : '') + '</span>';
       });
       html += '</div>';
       if ((d.agents || []).length) {
@@ -1105,15 +1231,41 @@ async function renderOrg(c) {
 /* ==================== 视图 9：治理中心 ==================== */
 const GOV_TABS = [
   { key: 'incentives', name: '立项与激励' },
-  { key: 'reimbursements', name: 'Token 报销' },
+  { key: 'reimbursements', name: 'AI 算力费用报销（Token）' },
   { key: 'audits', name: '审计日志' },
   { key: 'redlines', name: '开发红线' },
 ];
+/* 当前登录人是否可对本单本级审批（与后端分权规则一致，用于角标与按钮禁用） */
+function reimbActionable(r) {
+  if (!state.person || r.status === '已完成' || r.status === '已驳回') return false;
+  const tier = state.person.tier;
+  if (r.step === 1 || r.status === '待平台长审批') return ['coach', 'backbone', 'boss'].indexOf(tier) >= 0;
+  if (r.step === 2 || r.status === '待数字化复核') return tier === 'coach';
+  if (r.step === 3 || r.status === '待财务报销') {
+    return (tier === 'backbone' || tier === 'boss') && (state.person.dept_name || '').indexOf('财务') >= 0;
+  }
+  return false;
+}
+function reimbWaitTip(r) {
+  if (r.status === '待平台长审批') return '此单待平台长审批（需教练团/业务骨干/高管操作）';
+  if (r.status === '待数字化复核') return '此单待数字化平台长复核（仅教练团可操作）';
+  if (r.status === '待财务报销') return '此单待财务报销（仅财务部骨干/高管可操作）';
+  return '当前状态不可审批';
+}
 async function renderGovernance(c) {
+  /* 支持深链 #/governance/<tab> */
+  const sub = (location.hash || '').replace(/^#\/?/, '').split('/')[1];
+  if (sub && GOV_TABS.some(function (t) { return t.key === sub; })) govState.tab = sub;
+  let pendCount = 0;
+  try {
+    const rl = await api('/api/governance/reimbursements');
+    pendCount = rl.filter(reimbActionable).length;
+  } catch (e) { /* 角标失败不阻塞页面 */ }
   c.innerHTML = '<div class="data-card !p-0">' +
-    '<div class="flex px-4 pt-3 border-b border-gray-100 space-x-1">' +
+    '<div class="flex px-4 pt-3 border-b border-gray-100 space-x-1 flex-wrap">' +
     GOV_TABS.map(function (t) {
-      return '<div class="zone-tab ' + (govState.tab === t.key ? 'active' : '') + '" onclick="switchGovTab(\'' + t.key + '\')">' + t.name + '</div>';
+      return '<div class="zone-tab ' + (govState.tab === t.key ? 'active' : '') + '" onclick="switchGovTab(\'' + t.key + '\')">' + t.name +
+        (t.key === 'reimbursements' && pendCount > 0 ? ' <span class="badge bg-danger">' + pendCount + '</span>' : '') + '</div>';
     }).join('') + '</div>' +
     '<div id="gov-body" class="p-4">' + loadingHtml() + '</div></div>';
   await loadGovTab();
@@ -1184,12 +1336,13 @@ async function submitIncentive() {
 }
 async function renderReimbursements(box) {
   const list = await api('/api/governance/reimbursements');
-  let html = '<div class="flex justify-end mb-3"><button class="btn-primary" onclick="openReimbModal()">+ 申报报销</button></div>';
+  let html = '<div class="flex justify-end mb-3"><button class="btn-primary" onclick="openReimbModal()">+ 申报算力费用</button></div>';
   if (!list.length) html += emptyHtml('暂无报销记录');
   else {
     html += '<div class="space-y-3">' + list.map(function (r) {
       const final = r.status === '已完成' || r.status === '已驳回';
-      const canOp = canReview() && !final;
+      const actionable = !final && reimbActionable(r);
+      const tip = reimbWaitTip(r);
       let steps = '<div class="step-flow mt-2">';
       REIMB_STEPS.forEach(function (name, i) {
         const stepNo = i + 1;
@@ -1209,17 +1362,19 @@ async function renderReimbursements(box) {
           '<div class="text-sm text-gray-600">' + fmtNum(r.tokens) + ' tokens · <b class="text-accent">¥' + fmtNum(r.amount) + '</b> · ' + fmtTime(r.created_at) + '</div></div>' +
         steps +
         '<div class="flex justify-end space-x-2 mt-2">' +
-          (canOp
+          (actionable
             ? '<button class="btn-success-sm" onclick="approveReimb(' + r.id + ',\'approve\')">本级通过</button>' +
               '<button class="btn-danger-sm" onclick="openReimbReject(' + r.id + ')">驳回</button>'
-            : (final ? '' : '<span class="text-xs text-gray-400">需业务骨干/教练团审批</span>')) +
+            : (final ? '' :
+              '<button class="btn-success-sm" disabled title="' + esc(tip) + '">本级通过</button>' +
+              '<button class="btn-danger-sm" disabled title="' + esc(tip) + '">驳回</button>')) +
         '</div></div>';
     }).join('') + '</div>';
   }
   box.innerHTML = html;
 }
 function openReimbModal() {
-  openModal('<h3 class="font-bold text-primary text-lg mb-4">申报 Token 报销</h3>' +
+  openModal('<h3 class="font-bold text-primary text-lg mb-4">申报 AI 算力费用报销（Token）</h3>' +
     '<div class="space-y-3">' +
       '<div><label class="form-label">服务商 *</label><input id="nr-provider" class="form-input" placeholder="如：智谱GLM"></div>' +
       '<div class="grid grid-cols-2 gap-3">' +
@@ -1357,6 +1512,10 @@ async function renderRoadmap(c) {
 window.addEventListener('DOMContentLoaded', function () {
   buildSidebar();
   document.getElementById('btn-heartbeat').addEventListener('click', runHeartbeat);
+  var menuBtn = document.getElementById('btn-menu');
+  if (menuBtn) menuBtn.addEventListener('click', function () {
+    document.getElementById('app-view').classList.toggle('sidebar-open');
+  });
   window.addEventListener('hashchange', route);
   window.addEventListener('resize', function () {
     charts.forEach(function (c) { try { c.resize(); } catch (e) {} });
