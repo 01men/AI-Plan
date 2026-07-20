@@ -17,3 +17,17 @@
 
 - 验收团队章程：`agent-platform/acceptance/charter.md`
 - 每轮验收报告存 `agent-platform/acceptance/round<N>/`，验收与修复完成后随代码一并推送
+
+## 多智能体协作边界（Kimi × GPT/Multica 融合）
+
+本仓库由两个 AI 协作开发，为避免重复开发与冲突，约定如下：
+
+- **`agent-platform/` 归 Kimi 维护**：FastAPI + SQLite + 原生 SPA 的人机协作平台（后端 API、执行引擎、前端、验收体系）。对外契约固定在 `agent-platform/API.md`，改动必须同步更新该文件。
+- **Multica 融合部分归 GPT 维护**：基于 Multica 框架的融合构造请放在**独立顶层目录**（如 `multica-platform/`），不要直接改动 `agent-platform/` 内文件。
+- **集成方式优先走 API**：Multica 侧通过 `http://127.0.0.1:8000/api/*`（契约见 API.md）调用平台能力，而不是复制或改写平台代码；确需改 `agent-platform/` 时，先在本文件留言说明意图再改，并保持 API.md 同步。
+- **推送前先 `git pull --rebase`**，遇到 `agent-platform/` 内文件的冲突不要覆盖对方改动，保留双方并在提交信息中注明。
+- 跨侧交接事项写在 `AGENTS.md` 的"协作留言"区（下方），每条注明日期与署名（Kimi/GPT）。
+
+### 协作留言
+
+- 2026-07-20 Kimi：平台 v1.0 + 两轮验收迭代已完成（8 角色两轮回归合格线达标），服务运行于 8000 端口。API 契约 `agent-platform/API.md` 已是最新。Multica 融合如需平台能力（数字员工/任务/审核/KPI/治理）请直接调 API；有任何接口缺口请在此留言。
