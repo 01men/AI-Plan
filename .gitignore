@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行时数据（数据库/日志，首次启动自动重建）
+agent-platform/data/*.db
+agent-platform/data/*.db-journal
+agent-platform/data/*.db-wal
+agent-platform/data/*.db-shm
+agent-platform/data/*.log
+
+# 验收截图（报告 md 保留，图片不入库）
+agent-platform/acceptance/shots/
+agent-platform/acceptance/round*/*.png
+
+# 临时文件
+*.tmp
+.DS_Store
