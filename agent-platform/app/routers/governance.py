@@ -23,6 +23,9 @@ REIMB_FLOW = {1: ("待平台长审批", "待数字化复核"), 2: ("待数字化
 # 激励申报金额档位（元）
 INCENTIVE_AMOUNT_RANGE = {"火花奖": (500, 2000), "银齿轮奖": (5000, 10000), "金扳手奖": (30000, 50000)}
 
+# 激励奖项类型枚举（仅允许这四种；带空格等变体与未收录奖项一律 422 拦截）
+INCENTIVE_TYPES = ("火花奖", "银齿轮奖", "金扳手奖", "种子基金")
+
 
 @router.get("/incentives")
 def list_incentives(status: str = None, conn=Depends(db_conn), person=Depends(get_current_person)):
@@ -42,6 +45,8 @@ def create_incentive(body: dict = Body(...), conn=Depends(db_conn),
     if not nominee:
         raise HTTPException(400, "nominee 必填")
     itype = body.get("type", "火花奖")
+    if itype not in INCENTIVE_TYPES:
+        raise HTTPException(422, "奖项类型仅允许：火花奖/银齿轮奖/金扳手奖/种子基金")
     amount = body.get("amount", 0)
     if itype in INCENTIVE_AMOUNT_RANGE:
         lo, hi = INCENTIVE_AMOUNT_RANGE[itype]
@@ -144,8 +149,18 @@ def approve_reimbursement(rid: int, body: dict = Body(...), conn=Depends(db_conn
 
 
 @router.get("/audits")
-def list_audits(conn=Depends(db_conn), person=Depends(get_current_person)):
-    return [dict(r) for r in conn.execute("SELECT * FROM audits ORDER BY id DESC LIMIT 100")]
+def list_audits(action: str = None, limit: int = 100, conn=Depends(db_conn),
+                person=Depends(get_current_person)):
+    """审计查询：action 精确筛选；limit 默认 100、上限 500"""
+    limit = max(1, min(limit, 500))
+    sql = "SELECT * FROM audits"
+    args = []
+    if action:
+        sql += " WHERE action=?"
+        args.append(action)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    return [dict(r) for r in conn.execute(sql, args)]
 
 
 @router.get("/redlines")

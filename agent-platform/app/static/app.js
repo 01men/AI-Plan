@@ -19,6 +19,13 @@ const AGENT_CATEGORY_LIST = ['业务/项目助理', '智造运营/会议纪要',
 const PRIORITY_META = { '高': 'bg-danger', '中': 'bg-accent', '低': 'bg-gray-400' };
 const LEVEL_META = { L1: 'bg-success', L2: 'bg-secondary', L3: 'bg-accent', L4: 'bg-danger' };
 const INCENTIVE_META = { '火花奖': 'bg-accent', '银齿轮奖': 'bg-gray-400', '金扳手奖': 'badge-gold', '种子基金': 'bg-teal' };
+/* 激励奖项金额档位（申报表单金额框旁预提示，随奖项类型联动） */
+const INCENTIVE_TIER_HINT = {
+  '火花奖': '档位参考：500 – 2,000 元（小额即时激励）',
+  '银齿轮奖': '档位参考：5,000 – 10,000 元',
+  '金扳手奖': '档位参考：30,000 – 50,000 元',
+  '种子基金': '档位参考：不设上下限，按项目评审确定',
+};
 const SCENARIO_STATUS_META = { '待立项': 'bg-gray-400', '已立项': 'bg-secondary', '开发中': 'bg-accent', '试点中': 'bg-teal', '已验收': 'bg-success', '已下线': 'bg-danger' };
 const ZONE_META = {
   discussion: { name: '讨论区',       desc: '和同事讨论，AI 不打扰', ph: '和同事聊聊想法……（AI 不会在这里插话）' },
@@ -426,6 +433,19 @@ async function renderDashboard(c) {
 
   /* ⑥ 心跳动态流 */
   html += '<div class="data-card"><h3 class="font-bold text-primary mb-3">心跳动态流</h3>';
+  /* 后端新增 latest_report 时置顶"最新日报"卡（防御性：字段缺失或结构异常时保持现状） */
+  const lr = d.latest_report;
+  if (lr && typeof lr === 'object' && lr.content) {
+    html += '<div class="feed-report p-3 mb-3">' +
+      '<div class="flex items-center flex-wrap gap-x-2 text-xs text-gray-500 mb-1.5">' +
+        '<span class="badge bg-accent">最新日报</span>' +
+        '<span class="font-bold text-gray-700">' + esc(lr.workspace_name || '') + '</span>' +
+        '<span>' + fmtTime(lr.created_at) + '</span>' +
+        (lr.workspace_id ? '<span class="ml-auto text-xs text-accent font-bold cursor-pointer hover:underline" onclick="gotoWorkspaceZone(' + lr.workspace_id + ',\'agent\')">查看日报 →</span>' : '') +
+      '</div>' +
+      '<div class="max-h-40 overflow-y-auto">' + mdLite(String(lr.content).slice(0, 600)) + '</div>' +
+    '</div>';
+  }
   const feed = d.feed || [];
   if (!feed.length) html += emptyHtml('暂无心跳动态');
   else {
@@ -595,10 +615,24 @@ async function switchZone(zone) {
   wsState.zone = zone;
   await loadWorkspacePanel();
 }
+/* 交付卡片实时上下文：task_id→task 映射 + 每个 task 的最高交付版本（消息 payload 里的状态只是发出时的快照） */
+const wsTaskCtx = { map: {}, maxVer: {} };
 async function loadMessages(scrollToDeliverable) {
   const box = document.getElementById('msg-list');
   if (!box) return;
+  /* 消息与该工作区任务并行拉取；tasks 接口异常时降级为按 payload 快照渲染 */
+  const tasksReq = api('/api/tasks?workspace_id=' + wsState.id).catch(function () { return null; });
   const msgs = await api('/api/workspaces/' + wsState.id + '/messages?zone=' + wsState.zone + '&limit=200');
+  const tasks = await tasksReq;
+  wsTaskCtx.map = {};
+  wsTaskCtx.maxVer = {};
+  (tasks || []).forEach(function (t) { wsTaskCtx.map[t.id] = t; });
+  msgs.forEach(function (m) {
+    const p = m.payload || {};
+    if (m.msg_type === 'deliverable' && p.task_id && p.version) {
+      wsTaskCtx.maxVer[p.task_id] = Math.max(wsTaskCtx.maxVer[p.task_id] || 0, p.version);
+    }
+  });
   if (!msgs.length) box.innerHTML = emptyHtml('本区暂无消息，来发第一条吧');
   else box.innerHTML = msgs.map(messageHtml).join('');
   if (scrollToDeliverable) {
@@ -613,7 +647,7 @@ const ROBOT_SVG = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><p
 function messageHtml(m) {
   const t = fmtTime(m.created_at);
   if (m.sender_type === 'system') {
-    return '<div class="flex justify-center my-2"><div class="text-xs text-gray-500 bg-gray-200/70 rounded-full px-4 py-1 max-w-[85%] text-center">' + esc(m.content) + '</div></div>';
+    return '<div class="flex justify-center my-2"><div class="md-sys text-xs text-gray-500 bg-gray-200/70 rounded-full px-4 py-1 max-w-[85%] text-center">' + mdLite(m.content) + '</div></div>';
   }
   if (m.msg_type === 'deliverable') return deliverableHtml(m, t);
   if (m.sender_type === 'human') {
@@ -621,24 +655,34 @@ function messageHtml(m) {
       '<div class="text-xs text-gray-400 mb-1">' + esc(m.sender_name) + ' · ' + t + '</div>' +
       '<div class="msg-bubble msg-bubble-human">' + esc(m.content) + '</div></div></div>';
   }
-  /* agent 消息 */
+  /* agent 消息（含私聊打磨稿、日报 report）：走 mdLite 渲染 markdown */
   const ag = cache.agentMap[m.sender_id] || {};
+  const isReport = m.msg_type === 'report';
   return '<div class="flex my-2.5"><div class="msg-avatar bg-teal mr-2">' + ROBOT_SVG + '</div>' +
     '<div class="flex flex-col max-w-full"><div class="text-xs text-gray-400 mb-1">' + esc(m.sender_name) +
-    (ag.dept_name ? ' · ' + esc(ag.dept_name) : '') + ' · ' + t + '</div>' +
-    '<div class="msg-bubble msg-bubble-agent">' + esc(m.content) + '</div></div></div>';
+    (ag.dept_name ? ' · ' + esc(ag.dept_name) : '') + (isReport ? ' · 日报' : '') + ' · ' + t + '</div>' +
+    '<div class="msg-bubble msg-bubble-agent' + (isReport ? ' max-h-72 overflow-y-auto' : '') + '">' + mdLite(m.content) + '</div></div></div>';
 }
 function deliverableHtml(m, t) {
   const p = m.payload || {};
-  const canRev = canReview() && p.task_id && p.status === '待审核';
+  /* 以任务实时状态为准（tasks 拉取失败时退回 payload 快照）；旧版本卡片显示"已被取代"灰条 */
+  const task = p.task_id ? wsTaskCtx.map[p.task_id] : null;
+  const effStatus = task ? task.status : (p.status || '');
+  const maxV = wsTaskCtx.maxVer[p.task_id] || 0;
+  const superseded = !!(p.task_id && p.version && maxV > p.version);
   let actionBar = '';
   if (p.task_id) {
-    if (canRev) {
-      actionBar = '<div class="mt-3 pt-2 border-t border-gray-100 flex items-center justify-end space-x-2">' +
-        '<button class="btn-success-sm" onclick="reviewTaskAction(' + p.task_id + ',\'approve\')">通过</button>' +
-        '<button class="btn-danger-sm" onclick="openRejectModal(' + p.task_id + ')">驳回</button></div>';
-    } else if (p.status === '待审核') {
-      actionBar = '<div class="mt-3 pt-2 border-t border-gray-100 text-right text-xs text-gray-400">需业务骨干/教练团审核</div>';
+    if (superseded) {
+      actionBar = '<div class="mt-3 pt-2 border-t border-gray-100">' +
+        '<div class="bg-gray-100 text-gray-400 text-xs rounded px-3 py-1.5 text-center">已被 v' + maxV + ' 取代，请以最新版本为准</div></div>';
+    } else if (effStatus === '待审核') {
+      if (canReview()) {
+        actionBar = '<div class="mt-3 pt-2 border-t border-gray-100 flex items-center justify-end space-x-2">' +
+          '<button class="btn-success-sm" onclick="reviewTaskAction(' + p.task_id + ',\'approve\')">通过</button>' +
+          '<button class="btn-danger-sm" onclick="openRejectModal(' + p.task_id + ')">驳回</button></div>';
+      } else {
+        actionBar = '<div class="mt-3 pt-2 border-t border-gray-100 text-right text-xs text-gray-400">需业务骨干/教练团审核</div>';
+      }
     }
   }
   return '<div class="flex my-3"><div class="msg-avatar bg-accent mr-2">' + ROBOT_SVG + '</div>' +
@@ -648,7 +692,7 @@ function deliverableHtml(m, t) {
         '<span class="text-xs text-gray-500">' + esc(m.sender_name) + '</span>' +
         (p.version ? '<span class="badge bg-secondary">v' + p.version + '</span>' : '') +
         (p.rework ? '<span class="badge bg-accent">按驳回意见修订</span>' : '') +
-        (p.status ? statusBadge(p.status, TASK_STATUS_META) : '') + '</div>' +
+        (effStatus ? statusBadge(effStatus, TASK_STATUS_META) : '') + '</div>' +
         '<span class="text-xs text-gray-400">任务 #' + (p.task_id ?? '-') + ' · ' + t + '</span></div>' +
       '<div class="deliverable-body mt-2">' + mdLite(m.content) + '</div>' +
       actionBar +
@@ -999,6 +1043,7 @@ async function renderTasks(c) {
         '<div class="flex items-center justify-between mt-2 text-xs">' +
           '<span class="text-gray-400">创建人：' + esc(t.creator_name || '-') + '</span>' +
           (t.deadline ? '<span class="' + deadlineCls + '">截止 ' + fmtTime(t.deadline) + '</span>' : '') + '</div>' +
+        (!t.agent_id ? '<div class="mt-2 bg-orange-50 border border-orange-200 text-orange-700 text-xs rounded px-2 py-1.5 leading-snug">未指派数字员工，不会自动执行，建议去协作空间 @ 派活</div>' : '') +
         (clickable ? '<div class="mt-2 text-xs ' + (canReview() ? 'text-accent font-medium' : 'text-gray-400') + '">' +
           (canReview() ? '点击审核 →' : '需业务骨干/教练团审核') + '</div>' : '') +
       '</div>';
@@ -1188,14 +1233,15 @@ async function renderOrg(c) {
   let html = '<div class="data-card !py-3 mb-4 flex items-center space-x-3 bg-gradient-to-r from-primary/5 to-teal/5">' +
     '<svg class="w-6 h-6 text-teal shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>' +
     '<div class="text-sm text-gray-600">Teams.md 理念：<b class="text-primary">AI 通过通讯录理解组织</b>，调度人与数字员工协同作战——五个业务平台、部门与数字员工在此一图总览。</div></div>';
-  tree.forEach(function (p, pi) {
+  tree.forEach(function (p) {
     let deptCount = (p.departments || []).length;
     let agentCount = 0, peopleCount = 0;
     (p.departments || []).forEach(function (d) {
       agentCount += (d.agents || []).length;
       peopleCount += (d.people || []).length;
     });
-    html += '<details class="tree-platform data-card !p-0 mb-3" ' + (pi === 0 ? 'open' : '') + '><summary class="flex items-center space-x-3 px-4 py-3">' +
+    /* 默认全部展开（保留 summary 可手动收起），让各平台人员首屏可达 */
+    html += '<details class="tree-platform data-card !p-0 mb-3" open><summary class="flex items-center space-x-3 px-4 py-3">' +
       '<span class="tree-arrow text-gray-400">▶</span>' +
       '<span class="w-3 h-3 rounded-full shrink-0" style="background:' + esc(p.color || '#2c5282') + '"></span>' +
       '<span class="font-bold text-primary">' + esc(p.name) + '</span>' +
@@ -1306,19 +1352,26 @@ async function renderIncentives(box) {
   }
   box.innerHTML = html;
 }
+function updateIncentiveTierHint() {
+  const sel = document.getElementById('ni-type');
+  const hint = document.getElementById('ni-tier-hint');
+  if (sel && hint) hint.textContent = INCENTIVE_TIER_HINT[sel.value] || '';
+}
 function openIncentiveModal() {
   openModal('<h3 class="font-bold text-primary text-lg mb-4">申报激励</h3>' +
     '<div class="space-y-3">' +
       '<div class="grid grid-cols-2 gap-3">' +
-        '<div><label class="form-label">奖项类型</label><select id="ni-type" class="form-select">' +
+        '<div><label class="form-label">奖项类型</label><select id="ni-type" class="form-select" onchange="updateIncentiveTierHint()">' +
           ['火花奖', '银齿轮奖', '金扳手奖', '种子基金'].map(function (t) { return '<option>' + t + '</option>'; }).join('') + '</select></div>' +
-        '<div><label class="form-label">金额（元）</label><input id="ni-amount" type="number" class="form-input" value="800" min="0"></div></div>' +
+        '<div><label class="form-label">金额（元）</label><input id="ni-amount" type="number" class="form-input" value="800" min="0">' +
+          '<div id="ni-tier-hint" class="text-xs text-accent font-medium mt-1"></div></div></div>' +
       '<div><label class="form-label">申报人/候选人 *</label><input id="ni-nominee" class="form-input" placeholder="姓名"></div>' +
       '<div><label class="form-label">申报理由</label><textarea id="ni-reason" class="form-textarea" rows="3" placeholder="事迹与贡献说明"></textarea></div>' +
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
       '<button class="btn-primary" onclick="submitIncentive()">提交申报</button></div>');
+  updateIncentiveTierHint();
 }
 async function submitIncentive() {
   const body = {

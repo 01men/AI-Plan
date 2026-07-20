@@ -4,7 +4,7 @@
 - 启动：`python -m uvicorn app.main:app --port 8000`（首次启动自动建库 `data/platform.db` 并播种）
 - 全部接口返回 JSON；错误格式统一为 `{"detail": "错误信息"}`（HTTP 状态码 400/401/404 等）
 - 认证：除 `POST /api/login` 外，所有接口都需要请求头 `Authorization: Bearer <token>`
-- 写操作（POST/PATCH/审核/审批）均会写入 `audits` 审计表
+- 写操作（POST/PATCH/审核/审批）均会写入 `audits` 审计表（`POST /api/login` 除外：登录是高频流水，不记审计）
 - 中文乱码提示：curl 直接 `-d` 内联中文在 Windows Git Bash 下会损坏编码，请用 `--data-binary @file.json`
   并加 `Content-Type: application/json; charset=utf-8`（前端 fetch/axios 无此问题）
 
@@ -207,7 +207,9 @@
 
 私聊区（第一轮验收新增）：`zone=="private"` 时不派活，由「项目管理智能体」生成一条需求打磨回复
 （把需求复述成结构化任务草稿 + 建议 @ 哪个数字员工 + 示例话术），响应多一个 `reply` 字段
-（`sender_type=agent`、`msg_type=text`、`zone=private`）：
+（`sender_type=agent`、`msg_type=text`、`zone=private`）。
+建议派活对象的选择（第二轮验收变更）：优先推荐本工作区成员中的数字员工（真实在区，至多 2 个，
+不含项目管理智能体自身）；本区无成员员工时才按需求关键词匹配全库员工类别兜底。
 ```json
 {
   "message": {"id": 40, "zone": "private", "...": "..."},
@@ -244,6 +246,14 @@
 权限（第一轮验收新增）：
 - 仅 `tier ∈ {boss, coach, backbone}` 可审核，否则 403 `{"detail":"当前身份无权审核任务，仅高管/教练团/骨干可审核"}`；
 - 不能审核自己发起的任务（reviewer ≠ creator），否则 403 `{"detail":"不能审核自己发起的任务"}`。
+
+审核人自动指派（第二轮验收变更）：派活或带 `agent_id` 直建任务时自动写入 `reviewer_id`，
+按序取人且**始终排除任务创建人**（取到创建人顺延下一位）：
+1. 任务关联场景（若有）所属部门中 `tier=backbone` 的人；
+2. 该工作区成员中 `tier ∈ {backbone, coach}` 的人；
+3. 全库任一 `coach`。
+
+候选全空时 `reviewer_id` 为 `null`（待指派；审核通过/驳回时会改写为实际审核人）。
 
 请求：
 ```json
@@ -314,7 +324,10 @@
   "trend": [{"date": "2026-07-06", "tasks_done": 11, "hours_saved": 8.3}],
   "feed": [{"id": 33, "workspace_id": 1, "workspace_name": "总经办·经营驾驶舱", "sender_type": "agent",
             "sender_name": "项目管理智能体", "zone": "agent", "msg_type": "report",
-            "content": "## 数字员工运营日报（2026-07-19）...", "created_at": "..."}]
+            "content": "## 数字员工运营日报（2026-07-19）...", "created_at": "..."}],
+  "latest_report": {"id": 33, "workspace_id": 1, "workspace_name": "总经办·经营驾驶舱",
+                    "sender_name": "项目管理智能体",
+                    "content": "## 数字员工运营日报（2026-07-20）...", "created_at": "2026-07-20T02:02:28"}
 }
 ```
 说明（第一轮验收变更）：
@@ -325,6 +338,9 @@
   新增 `investment.breakdown_detail` 给出各科目明细；
 - `benefit` 新增 `roi_year1_pct=57.5`、`roi_year2_pct=117.8`；
 - `trend` 固定近 14 天（无数据日期补 0）；`feed` 为最近 12 条 system/agent 消息；
+- **`latest_report`（第二轮验收新增）**：全库最新一条 `msg_type=report` 的日报消息对象
+  （含 `id/workspace_id/workspace_name/sender_name/content/created_at`），无日报时为 `null`；
+  前端可将其固定在动态流顶部展示，不受 `feed` 12 条截断影响；
 - 指标为实时计算：审核通过后 `acceptance_rate` 等立即变化，页面与 API 不同时刻读数不一致属时序现象。
 
 ### GET /api/metrics/agents
@@ -339,6 +355,8 @@
 
 ### POST /api/governance/incentives
 请求：`{"type": "火花奖", "nominee": "陈思思", "reason": "...", "amount": 800}`（status 固定 `申报中`，申报写 audits）。
+类型校验（第二轮验收新增）：`type` 仅允许 `火花奖/银齿轮奖/金扳手奖/种子基金`（缺省 `火花奖`；
+未收录奖项或带空格等变体一律拦截），否则 422 `{"detail":"奖项类型仅允许：火花奖/银齿轮奖/金扳手奖/种子基金"}`。
 金额档位校验（第一轮验收新增）：`火花奖 500-2000 / 银齿轮奖 5000-10000 / 金扳手奖 30000-50000`（元），
 超出档位 422 `{"detail":"火花奖申报金额须在 500-2000 元之间，当前 3000 元超出档位"}`（`种子基金` 不限档）。
 
@@ -368,7 +386,13 @@
 错误：400 已终结 / action 非法；403 越级/越权/同人连批；404 不存在。
 
 ### GET /api/governance/audits
-最近 100 条审计：`[{id, actor, action, target, detail, created_at}, ...]`（按 id 倒序）
+审计查询（按 id 倒序）：`[{id, actor, action, target, detail, created_at}, ...]`
+
+查询参数（第二轮验收新增，均可选）：
+- `action`：按动作名精确筛选，如 `?action=激励评定`；
+- `limit`：返回条数，默认 100，上限 500（超出按 500 计）。
+
+注：登录不记审计（高频流水），audits 中不会出现 `登录` 动作的新记录。
 
 ### GET /api/governance/redlines
 六大红线（内置常量）：

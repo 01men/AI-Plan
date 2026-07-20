@@ -215,14 +215,30 @@ def generate_deliverable(conn, agent, req):
 
 
 def _pick_reviewer(conn, workspace_id, creator_id):
-    """审核人：优先工作区创建人，其次任一教练团成员"""
-    if creator_id:
-        return creator_id
-    row = conn.execute("SELECT created_by FROM workspaces WHERE id=?", (workspace_id,)).fetchone()
-    if row and row["created_by"]:
-        return row["created_by"]
-    coach = conn.execute("SELECT id FROM people WHERE tier='coach' LIMIT 1").fetchone()
-    return coach["id"] if coach else None
+    """审核人按序指派，始终排除任务创建人（取到创建人顺延下一位；候选全空返回 None）：
+    a. 任务关联场景（若有）所属部门中 tier=backbone 的人；
+    b. 该工作区成员中 tier ∈ {backbone, coach} 的人；
+    c. 全库任一 coach。
+    """
+    candidates = []
+    if workspace_id:
+        # a. 场景所属部门的骨干
+        candidates += [r["id"] for r in conn.execute(
+            "SELECT p.id FROM people p WHERE p.tier='backbone' AND p.dept_id=("
+            "  SELECT s.dept_id FROM scenarios s JOIN workspaces w ON w.scenario_id=s.id"
+            "  WHERE w.id=?) ORDER BY p.id", (workspace_id,))]
+        # b. 工作区成员中的骨干/教练
+        candidates += [r["id"] for r in conn.execute(
+            "SELECT p.id FROM workspace_members wm JOIN people p ON p.id=wm.member_id "
+            "WHERE wm.workspace_id=? AND wm.member_type='human' "
+            "AND p.tier IN ('backbone','coach') ORDER BY p.id", (workspace_id,))]
+    # c. 全库任一教练团成员
+    candidates += [r["id"] for r in conn.execute(
+        "SELECT id FROM people WHERE tier='coach' ORDER BY id")]
+    for pid in candidates:
+        if pid != creator_id:
+            return pid
+    return None
 
 
 def _add_message(conn, wid, stype, sid, sname, zone, mtype, content, payload=None):
@@ -296,8 +312,18 @@ def _person_name(conn, pid):
 
 # ---------------- 私聊区：项目管理智能体需求打磨 ----------------
 
-def _suggest_agent(conn, content):
-    """按需求关键词粗匹配推荐数字员工，兜底为任一试点中员工"""
+def _suggest_agents(conn, workspace_id, content):
+    """私聊派活建议，返回 (推荐员工名列表, 是否本工作区成员)。
+
+    优先推荐该工作区成员中的数字员工（真实在区，至多 2 个，排除项目管理智能体自身）；
+    工作区无成员员工时再按需求关键词匹配类别，兜底为任一试点中员工。
+    """
+    rows = conn.execute(
+        "SELECT a.name FROM workspace_members wm JOIN agents a ON a.id=wm.member_id "
+        "WHERE wm.workspace_id=? AND wm.member_type='agent' AND a.status NOT IN ('已下线') "
+        "AND a.name<>'项目管理智能体' ORDER BY a.id LIMIT 2", (workspace_id,)).fetchall()
+    if rows:
+        return [r["name"] for r in rows], True
     rules = [
         (("外贸", "订单", "单证", "唛头", "客户", "跟单"), "外贸跟单数字员工"),
         (("会议", "纪要", "待办", "例会"), "会议纪要数字员工"),
@@ -309,10 +335,10 @@ def _suggest_agent(conn, content):
         if any(k in content for k in keys):
             row = conn.execute("SELECT name FROM agents WHERE name=?", (name,)).fetchone()
             if row:
-                return row["name"]
+                return [row["name"]], False
     row = conn.execute(
         "SELECT name FROM agents WHERE status='试点中' ORDER BY id LIMIT 1").fetchone()
-    return row["name"] if row else "外贸跟单数字员工"
+    return [row["name"] if row else "外贸跟单数字员工"], False
 
 
 def private_assist(conn, workspace_id, person, content):
@@ -323,10 +349,18 @@ def private_assist(conn, workspace_id, person, content):
     pm = conn.execute("SELECT * FROM agents WHERE name='项目管理智能体'").fetchone()
     if not pm:
         return None
-    suggested = _suggest_agent(conn, content)
+    suggested, in_ws = _suggest_agents(conn, workspace_id, content)
     brief = content.strip().replace("\n", " ")
     if len(brief) > 60:
         brief = brief[:60] + "…"
+    if in_ws and len(suggested) > 1:
+        sug_line = (f"本工作区成员 {'、'.join('**@' + n + '**' for n in suggested)} 均可承接，"
+                    f"建议优先 **@{suggested[0]}**（均为本区真实在区数字员工）。")
+    elif in_ws:
+        sug_line = (f"建议直接在本工作区 **@{suggested[0]}** 派活"
+                    f"（该数字员工是本区真实在区成员，与此类需求匹配）。")
+    else:
+        sug_line = f"建议到协作空间 **@{suggested[0]}** 处理此类需求（与该需求匹配度最高）。"
     reply = f"""## 需求打磨草稿
 
 **{person['name']}，您的需求**：{brief}
@@ -337,10 +371,10 @@ def private_assist(conn, workspace_id, person, content):
 - **审核节点**：交付物生成后须人工审核方可生效，全程留痕
 
 ### 二、建议派活对象
-建议到协作空间 **@{suggested}** 处理此类需求（与该需求匹配度最高）。
+{sug_line}
 
 ### 三、示例话术
-> @{suggested} 请帮我处理：{brief}。要求输出结构化结果，并标注需人工确认的事项。
+> @{suggested[0]} 请帮我处理：{brief}。要求输出结构化结果，并标注需人工确认的事项。
 
 > 以上由项目管理智能体自动整理，确认后可复制示例话术到协作空间直接派活。"""
     return _add_message(conn, workspace_id, "agent", pm["id"], pm["name"],

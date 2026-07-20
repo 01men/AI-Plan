@@ -64,7 +64,7 @@ def login(body: LoginIn, conn=Depends(db_conn)):
     token = uuid.uuid4().hex
     conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"token:{token}", str(person["id"])))
     conn.commit()
-    audit(conn, person["name"], "登录", "auth", f"{person['name']} 登录平台")
+    # 登录是高频流水，不写 audits，避免刷屏淹没真实操作审计
     return {"token": token, "person": person_view(conn, person)}
 
 

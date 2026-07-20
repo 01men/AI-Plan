@@ -1,0 +1,1 @@
+{"scenario":{"id":6,"dept_id":1,"agent_id":1,"name":"经营数据日报自动生成","description":"董事办扩围场景：经营数据日报自动生成","priority":"中","batch":"扩围","status":"已立项","expected_benefit":"预估5万/年","actions":["经营数据日报自动生成·资料采集与结构化","经营数据日报自动生成·智能分析与生成","经营数据日报自动生成·人工确认后归档"]},"workspace":{"id":7,"name":"项目·经营数据日报自动生成","type":"项目","scenario_id":6,"created_by":3,"created_at":"2026-07-20T09:53:07"}}

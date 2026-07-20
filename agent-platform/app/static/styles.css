@@ -106,6 +106,9 @@ body { font-family: 'Noto Sans SC', system-ui, sans-serif; background: #f1f5f9; 
 .md-h3 { font-size: .88rem; font-weight: 700; color: #2c5282; margin: .25rem 0 .05rem; }
 .md-li { padding-left: .6rem; }
 .md-body strong { color: #1a365d; }
+/* 系统消息 pill 内的 markdown 继承 pill 的小字灰色，不放大标题 */
+.md-sys .md-body, .md-sys .md-h1, .md-sys .md-h2, .md-sys .md-h3 { font-size: inherit; color: inherit; }
+.md-sys .md-h1, .md-sys .md-h2, .md-sys .md-h3 { margin: 0; font-weight: 600; }
 
 /* @ 候选弹层 */
 .at-popup { position: absolute; bottom: 100%; left: 0; margin-bottom: .35rem; background: #fff; border: 1px solid #e2e8f0;

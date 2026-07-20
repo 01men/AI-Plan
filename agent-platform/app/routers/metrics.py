@@ -88,6 +88,13 @@ def dashboard(conn=Depends(db_conn), person=Depends(get_current_person)):
         "JOIN workspaces w ON w.id=m.workspace_id "
         "WHERE m.sender_type IN ('system','agent') ORDER BY m.id DESC LIMIT 12")]
 
+    # 全库最新一条日报（供前端在动态流顶部固定展示，无则 None）
+    row = conn.execute(
+        "SELECT m.id, m.workspace_id, w.name workspace_name, m.sender_name, m.content,"
+        " m.created_at FROM messages m JOIN workspaces w ON w.id=m.workspace_id "
+        "WHERE m.msg_type='report' ORDER BY m.id DESC LIMIT 1").fetchone()
+    latest_report = dict(row) if row else None
+
     return {
         "kpi": {
             "coverage": {"value": coverage, "note": "已验收场景/场景总数"},
@@ -107,6 +114,7 @@ def dashboard(conn=Depends(db_conn), person=Depends(get_current_person)):
         "leaderboard": leaderboard,
         "trend": trend,
         "feed": feed,
+        "latest_report": latest_report,
     }
 
 
