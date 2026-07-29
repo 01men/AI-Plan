@@ -228,6 +228,10 @@
 聊天回复保存为普通 `agent/text` 消息，`payload.interaction_mode="chat"` 且携带脱敏
 `model_info`。正式派活响应仍使用 `dispatched[]`。400 content 必填 / zone 非法；
 422 模式非法、所选数字员工不是本工作区可用成员；404 工作区不存在。
+演示降级（R7+）：demo 模式未配置可用模型时仍返回带实质内容的演示回复
+（persona+项目上下文+知识/业务召回），内容以【演示回复·未配置模型算力】开头，
+`model_info` 为 `{provider:null, model:null, ok:false, reason:"演示回复（未配置模型）", demo_reply:true}`
+并写 `llm_calls`（provider=demo_reply）；production 模式保持"未配置可用模型"硬错误，不冒充真实模型。
 
 私聊区（第一轮验收新增）：`zone=="private"` 时不派活，由「项目管理智能体」生成一条需求打磨回复
 （把需求复述成结构化任务草稿 + 建议 @ 哪个数字员工 + 示例话术），响应多一个 `reply` 字段

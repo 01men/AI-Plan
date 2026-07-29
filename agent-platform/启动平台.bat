@@ -30,6 +30,14 @@ if not errorlevel 1 (
   pause
   exit /b 1
 )
+rem 启动前检查模型 Key（库不存在则跳过）：未配置仅提示，不阻断启动
+if exist data\platform.db (
+  python -c "import sqlite3,sys;c=sqlite3.connect('data/platform.db');sys.exit(0 if c.execute('SELECT COUNT(*) FROM model_providers WHERE length(api_key)>0 AND enabled=1').fetchone()[0] else 1)" >nul 2>&1
+  if errorlevel 1 (
+    echo  [提示] 未配置模型 Key：数字员工对话将为演示回复，请在 数字员工→模型 中配置
+    echo.
+  )
+)
 echo  正在启动服务，请稍候...
 echo  浏览器将自动打开 http://localhost:8000
 echo  关闭本窗口即停止平台服务。

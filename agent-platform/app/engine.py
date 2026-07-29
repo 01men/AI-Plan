@@ -465,10 +465,43 @@ def _chat_history(conn, workspace_id, agent_id, limit=14, person_id=None):
     return messages
 
 
+def _demo_chat_reply(conn, workspace_id, agent, person, content):
+    """演示模式降级回复：未配置模型算力时，以数字员工 persona + 项目/知识/业务
+    召回组织一段有实质内容的回答，供全新部署开箱演示（不代表真实模型推理）。"""
+    try:
+        skill_list = json.loads(agent["skills"] or "[]")
+    except Exception:
+        skill_list = []
+    skills_text = "、".join(str(s) for s in skill_list) if skill_list else "通用业务协同"
+    terms = _keyword_terms(content)
+    focus = "、".join(terms[:3]) if terms else (content or "").strip()[:20] or "本轮问题"
+    project_lines = _project_context(conn, workspace_id).splitlines()
+    project_brief = "；".join(project_lines[:2]) if project_lines else "暂无项目上下文"
+    knowledge = _knowledge_context(conn, person, content)
+    business = _business_context(conn, content)
+    return (
+        "【演示回复·未配置模型算力】\n\n"
+        f"我是数字员工「{agent['name']}」（编号 {agent['code']}，类别：{agent['category']}）。"
+        "当前环境未配置模型算力，以下回复由演示引擎基于我的职责、项目上下文、"
+        "授权知识库与业务数据召回组织，供演示参考。\n\n"
+        f"**我的职责**：{agent['description'] or '协助业务人员推进项目'}\n"
+        f"**我的技能**：{skills_text}\n\n"
+        f"**针对你的提问**（关键词：{focus}）：\n"
+        f"1. 项目现状：{project_brief}\n"
+        f"2. 知识库召回：{knowledge[:300]}\n"
+        f"3. 业务数据参考：{business[:300]}\n\n"
+        "**建议下一步**：\n"
+        f"- 先围绕「{focus}」核对上述项目任务与业务明细，确认信息缺口后补充给我；\n"
+        "- 将确认后的结论沉淀至知识库，便于后续持续召回；\n"
+        "- 由管理员在“数字员工→模型”配置并测试模型连接后，我将切换为真实智能对话。"
+    )
+
+
 def chat_with_agent(conn, workspace_id, agent_id, person, content):
     """以数字员工身份调用真实模型并持续对话，返回已落库的回复及模型信息。
 
-    不配置/调用失败时明确返回不可用原因，不用模板冒充模型回复。
+    不配置/调用失败时明确返回不可用原因，不用模板冒充模型回复；
+    演示模式下降级为标注明确的演示回复，保证全新部署开箱可演示。
     """
     agent = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
     if not agent:
@@ -476,12 +509,20 @@ def chat_with_agent(conn, workspace_id, agent_id, person, content):
     settings = _get_settings(conn)
     resolved = _resolve_llm(conn, settings, agent)
     if not resolved:
-        text = (
-            f"我是「{agent['name']}」。当前没有配置可用的模型算力，无法进行真实智能对话。"
-            "请由管理员在“数字员工→模型”中配置并测试模型连接后重试。"
-        )
-        info = {"provider": None, "model": None, "latency_ms": 0, "ok": False,
-                "reason": "未配置可用模型"}
+        from app.config import is_demo_mode  # 延迟导入，避免与 config 循环依赖
+        if is_demo_mode():
+            text = _demo_chat_reply(conn, workspace_id, agent, person, content)
+            info = {"provider": None, "model": None, "latency_ms": 0, "ok": False,
+                    "reason": "演示回复（未配置模型）", "demo_reply": True}
+            _log_llm_call(conn, None, agent["id"], "demo_reply", None, "demo_reply",
+                          fallback_reason="演示回复（未配置模型）")
+        else:
+            text = (
+                f"我是「{agent['name']}」。当前没有配置可用的模型算力，无法进行真实智能对话。"
+                "请由管理员在“数字员工→模型”中配置并测试模型连接后重试。"
+            )
+            info = {"provider": None, "model": None, "latency_ms": 0, "ok": False,
+                    "reason": "未配置可用模型"}
         mid = _add_message(
             conn, workspace_id, "agent", agent["id"], agent["name"], "agent", "text",
             text, {"interaction_mode": "chat", "model_info": info},

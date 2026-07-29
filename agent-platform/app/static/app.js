@@ -1087,7 +1087,8 @@ function messageHtml(m) {
     modelTrace = modelInfo.ok
       ? '<div class="text-[11px] text-teal mt-1">真实模型回复：' + esc(modelInfo.provider || '-') +
         ' / ' + esc(modelInfo.model || '-') + ' · ' + (modelInfo.latency_ms || 0) + 'ms</div>'
-      : '<div class="text-[11px] text-danger mt-1">模型未完成：' + esc(modelInfo.reason || '未配置可用模型') + '</div>';
+      : '<div class="text-[11px] text-danger mt-1">模型未完成：' + esc(modelInfo.reason || '未配置可用模型') +
+        (modelInfo.provider ? '' : '，请在 数字员工→模型 中配置 Key 并测试连接') + '</div>';
   }
   return '<div class="flex my-2.5"><div class="msg-avatar bg-teal mr-2">' + ROBOT_SVG + '</div>' +
     '<div class="flex flex-col max-w-full"><div class="text-xs text-gray-400 mb-1">' + esc(m.sender_name) +
@@ -1124,7 +1125,8 @@ function deliverableHtml(m, t) {
     modelLine = mi.fallback
       ? '<div class="text-[11px] text-amber-600 mt-1">模板模拟生成' +
         (mi.provider ? '（' + esc(mi.provider) + ' 调用失败已回落' +
-          (mi.reason ? '：' + esc(String(mi.reason).slice(0, 60)) : '') + '）' : '（未配置可用模型）') + '</div>'
+          (mi.reason ? '：' + esc(String(mi.reason).slice(0, 60)) : '') + '）'
+          : '（未配置可用模型，请在 数字员工→模型 中配置 Key 并测试连接）') + '</div>'
       : '<div class="text-[11px] text-teal mt-1">真实模型生成：' + esc(mi.provider || '-') +
         ' / ' + esc(mi.model || '-') + ' · ' + (mi.latency_ms || 0) + 'ms</div>';
   }
@@ -1218,9 +1220,12 @@ async function sendWsMessage() {
       const replies = r.replies || [];
       if (replies.length) {
         const ok = replies.filter(function (x) { return x.model_info && x.model_info.ok; }).length;
+        /* 演示回复/未配置模型（provider 为空）时补充配置入口指引，避免全新部署误以为对话故障 */
+        const needKey = replies.some(function (x) { return x.model_info && !x.model_info.provider; });
         toast(ok
           ? replies.map(function (x) { return x.agent_name; }).join('、') + ' 已完成真实模型回复'
-          : '模型未完成回复，请查看对话中的原因', ok ? 'info' : 'error');
+          : '模型未完成回复，请查看对话中的原因' +
+            (needKey ? '；请在 数字员工→模型 中配置 Key 并测试连接' : ''), ok ? 'info' : 'error');
       }
       if (r.chat_error) toast(r.chat_error, 'error');
       /* R5 兜底：无可用数字员工时明确告知，需求已登记为待处理任务 */
