@@ -18,6 +18,18 @@ if errorlevel 1 (
     exit /b 1
   )
 )
+where pdftotext >nul 2>&1
+if errorlevel 1 (
+  echo  [提示] 未检测到 pdftotext（poppler），PDF 知识文档解析将不可用；
+  echo         请安装 poppler 并将 bin 目录加入 PATH 后重启本脚本。其他功能不受影响。
+  echo.
+)
+netstat -ano | findstr ":8000 " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 (
+  echo  [错误] 8000 端口已被占用，请先关闭占用进程或已运行的平台实例。
+  pause
+  exit /b 1
+)
 echo  正在启动服务，请稍候...
 echo  浏览器将自动打开 http://localhost:8000
 echo  关闭本窗口即停止平台服务。

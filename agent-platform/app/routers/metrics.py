@@ -27,6 +27,15 @@ BENEFIT_TOTAL = 790000
 ROI_YEAR1_PCT = 57.5
 ROI_YEAR2_PCT = 117.8
 
+# KPI 目标值（行动方案口径）：经 /api/environment 的 kpi_targets 字段下发，前端替代硬编码
+KPI_TARGETS = {
+    "coverage": 70,                    # 验收覆盖率 ≥70%
+    "acceptance_rate": 85,             # 验收通过率 ≥85%
+    "active_rate": 60,                 # 活跃使用率（7日）≥60%
+    "accuracy": 95,                    # 交付准确率 ≥95%
+    "annual_benefit": BENEFIT_TOTAL,   # 年化综合收益 ¥79万
+}
+
 
 @router.get("/dashboard")
 def dashboard(conn=Depends(db_conn), person=Depends(get_current_person)):

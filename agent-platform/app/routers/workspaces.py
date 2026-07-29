@@ -125,8 +125,12 @@ def list_messages(wid: int, zone: str = None, limit: int = 200, conn=Depends(db_
     if zone:
         sql += " AND zone=?"
         args.append(zone)
+        if zone == "private":
+            # 私聊仅发起者本人可见（历史 NULL owner 数据视为无效私聊，不展示）
+            sql += " AND private_owner_id=?"
+            args.append(person["id"])
     sql += " ORDER BY id ASC LIMIT ?"  # 按时间升序
-    args.append(limit)
+    args.append(min(limit, 500))
     return [_msg_view(r) for r in conn.execute(sql, args)]
 
 
@@ -156,6 +160,8 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
     zone = body.get("zone", "discussion")
     if not content:
         raise HTTPException(400, "content 必填")
+    if len(content) > 20000:
+        raise HTTPException(422, "content 不能超过 20000 字符")
     if zone not in ("discussion", "agent", "private"):
         raise HTTPException(400, "zone 仅支持 discussion/agent/private")
     interaction_mode = body.get("interaction_mode")
@@ -164,26 +170,8 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
     if interaction_mode not in ("chat", "task"):
         raise HTTPException(422, "interaction_mode 仅支持 chat/task")
 
-    msg_id = conn.execute(
-        "INSERT INTO messages(workspace_id,sender_type,sender_id,sender_name,zone,msg_type,content,created_at)"
-        " VALUES(?,?,?,?,?,?,?,?)",
-        (wid, "human", person["id"], person["name"], zone, "text", content,
-         datetime.now().isoformat(timespec="seconds"))).lastrowid
-    conn.commit()
-
-    # 私聊区：不直接派活，由项目管理智能体把需求打磨成任务草稿并给出派活建议
-    if zone == "private":
-        reply_id = engine.private_assist(conn, wid, person, content)
-        conn.commit()
-        resp = {"message": _msg_view(conn.execute("SELECT * FROM messages WHERE id=?",
-                                                  (msg_id,)).fetchone()),
-                "dispatched": []}
-        if reply_id:
-            resp["reply"] = _msg_view(conn.execute("SELECT * FROM messages WHERE id=?",
-                                                   (reply_id,)).fetchone())
-        return resp
-
-    # 触发数字员工：显式 @ / target_agent_id 优先；否则沿用本区可用数字员工
+    # 触发数字员工：显式 @ / target_agent_id 优先；否则沿用本区可用数字员工。
+    # 全部校验必须在消息落库之前完成，避免 422 时用户消息已发出。
     targets = _find_mentioned_agents(conn, wid, content)
     target_agent_id = body.get("target_agent_id")
     if target_agent_id and not targets:
@@ -199,6 +187,27 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
         targets = [dict(r) for r in conn.execute(
             "SELECT a.id, a.name FROM workspace_members wm JOIN agents a ON a.id=wm.member_id "
             "WHERE wm.workspace_id=? AND wm.member_type='agent' AND a.status NOT IN ('已下线')", (wid,))]
+
+    msg_id = conn.execute(
+        "INSERT INTO messages(workspace_id,sender_type,sender_id,sender_name,zone,msg_type,content,"
+        "private_owner_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (wid, "human", person["id"], person["name"], zone, "text", content,
+         person["id"] if zone == "private" else None,  # 私聊归发起者本人可见
+         datetime.now().isoformat(timespec="seconds"))).lastrowid
+    conn.commit()
+
+    # 私聊区：不直接派活，由项目管理智能体把需求打磨成任务草稿并给出派活建议
+    if zone == "private":
+        reply_id = engine.private_assist(conn, wid, person, content)
+        conn.commit()
+        resp = {"message": _msg_view(conn.execute("SELECT * FROM messages WHERE id=?",
+                                                  (msg_id,)).fetchone()),
+                "dispatched": []}
+        if reply_id:
+            resp["reply"] = _msg_view(conn.execute("SELECT * FROM messages WHERE id=?",
+                                                   (reply_id,)).fetchone())
+        return resp
+
     dispatched, replies = [], []
     if interaction_mode == "chat":
         if not targets:
@@ -256,7 +265,8 @@ def workspace_chain(wid: int, conn=Depends(db_conn), person=Depends(get_current_
     for t in tasks:
         dmsgs = conn.execute(
             "SELECT created_at FROM messages WHERE workspace_id=? AND msg_type='deliverable' "
-            "AND payload LIKE ? ORDER BY id", (wid, f'%"task_id": {t["id"]}%')).fetchall()
+            "AND (payload LIKE ? OR payload LIKE ?) ORDER BY id",
+            (wid, f'%"task_id": {t["id"]},%', f'%"task_id": {t["id"]}}}%')).fetchall()
         version = len(dmsgs) or (1 if t["deliverable"] else 0)
         base = {"type": "task_event", "task_id": t["id"],
                 "agent_name": t["agent_name"] or "未指派", "version": version}

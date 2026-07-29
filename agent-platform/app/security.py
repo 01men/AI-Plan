@@ -20,15 +20,14 @@ def create_oauth_state(conn, provider: str, action: str, person_id: int | None =
 
 
 def consume_oauth_state(conn, token: str, provider: str) -> dict | None:
-    """原子消费 state；错误、过期、平台不匹配均返回 None，禁止重放。"""
+    """原子消费 state（DELETE ... RETURNING 单语句）；错误、过期、平台不匹配均返回 None，禁止重放。"""
     if not token or len(token) > 128:
         return None
-    key = f"oauth-state:{token}"
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    row = conn.execute("DELETE FROM settings WHERE key=? RETURNING value",
+                       (f"oauth-state:{token}",)).fetchone()
+    conn.commit()
     if not row:
         return None
-    conn.execute("DELETE FROM settings WHERE key=?", (key,))
-    conn.commit()
     try:
         payload = json.loads(row["value"])
         if payload.get("provider") != provider:
@@ -52,17 +51,16 @@ def create_login_code(conn, person_id: int, provider: str, ttl_minutes: int = 2)
 
 
 def consume_login_code(conn, code: str):
-    """一次性换取人员身份；成功后立即标记使用，禁止浏览器重放。"""
+    """一次性换取人员身份；条件 UPDATE + RETURNING 原子标记使用，禁止浏览器重放。"""
     if not code or len(code) > 128:
         return None
     row = conn.execute(
-        "SELECT * FROM oauth_login_codes WHERE code=? AND used_at IS NULL", (code,)
+        "UPDATE oauth_login_codes SET used_at=? WHERE code=? AND used_at IS NULL RETURNING *",
+        (datetime.now().isoformat(timespec="seconds"), code),
     ).fetchone()
+    conn.commit()
     if not row or datetime.fromisoformat(row["expires_at"]) < datetime.now():
         return None
-    conn.execute("UPDATE oauth_login_codes SET used_at=? WHERE code=?",
-                 (datetime.now().isoformat(timespec="seconds"), code))
-    conn.commit()
     return row
 
 

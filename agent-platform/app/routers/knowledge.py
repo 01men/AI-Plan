@@ -442,9 +442,13 @@ def _md_table(headers, rows):
 
 
 def _clean_html(text: str) -> str:
-    """网页类清洗：去 script/style 及其内容"""
+    """网页类清洗：去 script/style/iframe 及其内容，剔除 on* 事件属性与危险 URL 协议"""
     text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.I)
+    text = re.sub(r"<iframe[\s\S]*?</iframe>", "", text, flags=re.I)
+    text = re.sub(r"\son\w+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", "", text, flags=re.I)
+    text = re.sub(r"javascript\s*:", "", text, flags=re.I)
+    text = re.sub(r"data\s*:\s*text/html", "", text, flags=re.I)
     return text
 
 
@@ -690,5 +694,10 @@ def get_document_file(did: int, conn=Depends(db_conn), person=Depends(get_curren
     if not row["file_path"] or not Path(row["file_path"]).exists():
         raise HTTPException(404, "该文档没有可下载的解析产物（可能为台账登记文档）")
     media = "text/html" if row["converted_format"] == "html" else "text/markdown"
+    headers = None
+    if row["converted_format"] == "html":
+        # 存储型 XSS 防线：html 产物一律强制下载，不在平台同源内联渲染
+        headers = {"Content-Disposition":
+                   f'attachment; filename="{Path(row["file_path"]).name}"'}
     return FileResponse(row["file_path"], media_type=media,
-                        filename=Path(row["file_path"]).name)
+                        filename=Path(row["file_path"]).name, headers=headers)

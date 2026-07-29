@@ -20,6 +20,10 @@
 python -m pip install -r requirements.txt
 ```
 
+可选：如需解析 PDF 知识文档，需安装 poppler（提供 `pdftotext` 命令）并将其 `bin` 目录加入 PATH；未安装时其余功能正常，仅 PDF 上传解析会提示不可用。
+
+> 离线说明：平台**运行时完全离线可用**（前端零 CDN、模型未配置时自动模板兜底）；仅首次部署安装 Python 依赖与 poppler 时需要联网。
+
 **方式一（推荐）**：双击项目根目录下的 `启动平台.bat`，服务启动后约 3 秒自动打开浏览器。
 
 **方式二（命令行）**：
@@ -38,6 +42,8 @@ python -m uvicorn app.main:app --port 8000
 ## 二、演示身份与权限
 
 登录页从组织人员中选择身份，免密登录（演示环境），token 存于浏览器 localStorage。
+
+> 生产部署：设置环境变量 `PLATFORM_MODE=production` 后，免密登录、演示 OAuth 回调与公开人员列表全部关闭，仅支持企业 IM（钉钉/企业微信/飞书）授权登录；`GET /api/environment` 可供前端探测当前模式，`GET /api/health/ready` 会检查生产就绪阻断项（未配置真实 IM/模型时返回 503）。
 
 | 层级 | 人数 | 代表身份 | 权限差异 |
 | ---- | ---- | -------- | -------- |

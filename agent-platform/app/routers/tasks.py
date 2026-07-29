@@ -78,9 +78,18 @@ def create_task(body: dict = Body(...), conn=Depends(db_conn), person=Depends(ge
     - 带 agent_id：复用引擎执行逻辑，立即产出交付物并转「待审核」；
     - 不带 agent_id：允许创建（停留「待处理」），响应附带 hint 提示不会自动执行。
     """
+    if person["tier"] == "staff":
+        raise HTTPException(403, "普通员工请在已有工作区派活；创建任务请联系项目负责人")
     title = (body.get("title") or "").strip()
     if not title:
         raise HTTPException(400, "title 必填")
+    priority = body.get("priority", "中")
+    if priority not in HOURS_BY_PRIORITY:
+        raise HTTPException(422, "priority 仅支持 高/中/低")
+    reviewer_id = body.get("reviewer_id")
+    if reviewer_id and not conn.execute(
+            "SELECT 1 FROM people WHERE id=? AND status='在职'", (reviewer_id,)).fetchone():
+        raise HTTPException(422, "指定审核人不存在或已停用")
     agent_id = body.get("agent_id")
     workspace_id = body.get("workspace_id")
     if workspace_id:
@@ -96,11 +105,11 @@ def create_task(body: dict = Body(...), conn=Depends(db_conn), person=Depends(ge
                 (workspace_id, agent_id)).fetchone():
             raise HTTPException(422, "该数字员工尚未加入此工作区，请先由负责人配置成员")
     now = datetime.now().isoformat(timespec="seconds")
+    # status 不信任客户端：直建任务一律从「待处理」起步，状态机由引擎/审核推进
     tid = conn.execute(
         "INSERT INTO tasks(workspace_id,title,agent_id,creator_id,reviewer_id,status,priority,"
-        "requirement,deadline,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (workspace_id, title, agent_id, person["id"],
-         body.get("reviewer_id"), body.get("status", "待处理"), body.get("priority", "中"),
+        "requirement,deadline,created_at) VALUES(?,?,?,?,?,'待处理',?,?,?,?)",
+        (workspace_id, title, agent_id, person["id"], reviewer_id, priority,
          body.get("requirement", ""), body.get("deadline"), now)).lastrowid
     conn.commit()
     audit(conn, person["name"], "创建任务", title, f"任务 #{tid}")
@@ -114,14 +123,12 @@ def create_task(body: dict = Body(...), conn=Depends(db_conn), person=Depends(ge
     requirement = body.get("requirement") or title
     deliverable, model_info = engine.generate_deliverable(conn, agent, requirement, tid)
     reviewer = engine._pick_reviewer(conn, workspace_id, person["id"])
+    mode, exec_error, exec_ms = engine._execution_fields(model_info)
     conn.execute(
         "UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=?,model_provider=?,"
         "model_name=?,execution_mode=?,execution_error=?,execution_ms=? WHERE id=?",
         (deliverable, reviewer, model_info.get("provider"), model_info.get("model"),
-         "template_fallback" if model_info.get("fallback") and model_info.get("provider")
-         else ("template" if model_info.get("fallback") else "llm"),
-         model_info.get("reason") if model_info.get("provider") else None,
-         model_info.get("latency_ms", 0), tid),
+         mode, exec_error, exec_ms, tid),
     )
     if workspace_id:
         engine._add_message(conn, workspace_id, "agent", agent["id"], agent["name"],
@@ -159,10 +166,14 @@ def external_event(tid: int, body: dict = Body(...), conn=Depends(db_conn),
     metadata = body.get("metadata") or {}
     if not isinstance(metadata, dict):
         raise HTTPException(400, "metadata 必须是对象")
-    event_key = f"runtime-event:{source}:{event_id}"
+    # 幂等去重：runtime_events 按 (task_id, source, event_id) 唯一，同事件重复回传直接吞掉，
+    # 但不同任务的相同 event_id 互不影响（旧 settings 键方案会跨任务误吞，已废弃）
     try:
-        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
-                     (event_key, datetime.now().isoformat(timespec="seconds")))
+        conn.execute(
+            "INSERT INTO runtime_events(task_id,source,event_id,event_type,created_at)"
+            " VALUES(?,?,?,?,?)",
+            (tid, source, event_id, event_type,
+             datetime.now().isoformat(timespec="seconds")))
     except sqlite3.IntegrityError:
         conn.rollback()
         return {"ok": True, "idempotent": True, "task": _detail(conn, tid)}
@@ -221,8 +232,9 @@ def _latest_deliverable_is_external(conn, task):
         return False
     row = conn.execute(
         "SELECT payload FROM messages WHERE workspace_id=? AND msg_type='deliverable' "
-        "AND payload LIKE ? ORDER BY id DESC LIMIT 1",
-        (task["workspace_id"], f'%"task_id": {task["id"]}%')).fetchone()
+        "AND (payload LIKE ? OR payload LIKE ?) ORDER BY id DESC LIMIT 1",
+        (task["workspace_id"], f'%"task_id": {task["id"]},%',
+         f'%"task_id": {task["id"]}}}%')).fetchone()
     if not row or not row["payload"]:
         return False
     try:
@@ -255,9 +267,13 @@ def review_task(tid: int, body: dict = Body(...), conn=Depends(db_conn),
 
     if action == "approve":
         hours = HOURS_BY_PRIORITY.get(task["priority"], 2.0)
-        conn.execute(
-            "UPDATE tasks SET status='已通过', review_comment=?, reviewer_id=?, done_at=? WHERE id=?",
+        # 条件 UPDATE 原子抢占：并发审核只有一方 rowcount=1，失败方 409，不计产出
+        cur = conn.execute(
+            "UPDATE tasks SET status='已通过', review_comment=?, reviewer_id=?, done_at=? "
+            "WHERE id=? AND status='待审核'",
             (comment, person["id"], now, tid))
+        if cur.rowcount == 0:
+            raise HTTPException(409, "任务状态已被变更，请刷新后重试")
         if task["agent_id"]:
             # 累计档案产出 + 当日指标
             conn.execute("UPDATE agents SET tasks_done=tasks_done+1, hours_saved=ROUND(hours_saved+?,1)"
@@ -279,8 +295,12 @@ def review_task(tid: int, body: dict = Body(...), conn=Depends(db_conn),
         conn.commit()
         audit(conn, person["name"], "审核通过", f"任务#{tid}", comment)
     else:
-        conn.execute("UPDATE tasks SET status='已驳回', review_comment=?, reviewer_id=? WHERE id=?",
-                     (comment, person["id"], tid))
+        cur = conn.execute(
+            "UPDATE tasks SET status='已驳回', review_comment=?, reviewer_id=? "
+            "WHERE id=? AND status='待审核'",
+            (comment, person["id"], tid))
+        if cur.rowcount == 0:
+            raise HTTPException(409, "任务状态已被变更，请刷新后重试")
         conn.commit()
         audit(conn, person["name"], "审核驳回", f"任务#{tid}", comment)
         if task["agent_id"]:

@@ -50,7 +50,9 @@ def allowed_origins() -> list[str]:
 
 def public_environment() -> dict:
     """前端可安全读取的环境能力，不返回来源、凭证或内部配置。"""
+    from app.routers.metrics import KPI_TARGETS  # 延迟导入，避免与 routers 循环依赖
     return {
         "mode": platform_mode(),
         "demo_login_enabled": demo_login_enabled(),
+        "kpi_targets": dict(KPI_TARGETS),
     }

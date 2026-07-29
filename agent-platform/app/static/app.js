@@ -36,6 +36,8 @@ const TASK_COLUMNS = ['待处理', '进行中', '待审核', '已通过', '已�
 const TASK_STATUS_META = { '待处理': 'bg-gray-400', '进行中': 'bg-secondary', '待审核': 'bg-accent', '已通过': 'bg-success', '已驳回': 'bg-danger' };
 const REIMB_STEPS = ['平台长审批', '数字化复核', '财务报销'];
 const NODE_TYPE_META = { agent: '智能体主导', hybrid: '人机协同', human: '人类主导' };
+/* NAS 设备默认型号（知识库空间未登记设备时展示，可按实际部署修改） */
+const NAS_DEFAULT_DEVICE = '群晖DS925+';
 
 /* ==================== 全局状态 ==================== */
 const state = {
@@ -54,6 +56,18 @@ function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+/* 内联事件（onclick 等）中的字符串参数：JSON.stringify 自带引号与转义，模板里不要再包单引号；
+   外面再套 esc() 是为 HTML 属性上下文兜底（属性值中的 " 会被 HTML 解析器截断） */
+function jsStr(s) { return JSON.stringify(String(s ?? '')); }
+/* 防重复提交：await 期间禁用按钮，finally 恢复（弹窗关闭后节点已移除，恢复无害） */
+async function withBusy(btn, fn) {
+  if (!btn || btn.disabled) return;
+  const oldHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  try { await fn(); }
+  finally { btn.disabled = false; btn.innerHTML = oldHtml; }
 }
 function pad2(n) { return String(n).padStart(2, '0'); }
 function fmtTime(s) {
@@ -162,7 +176,8 @@ function errorHtml(msg) {
 /* ==================== API 封装 ==================== */
 async function api(path, options) {
   const headers = { 'Content-Type': 'application/json; charset=utf-8' };
-  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  const reqToken = state.token;   // 本次请求携带的 token（响应到达时会话可能已变更）
+  if (reqToken) headers['Authorization'] = 'Bearer ' + reqToken;
   let res;
   try {
     res = await fetch(path, Object.assign({}, options || {}, { headers: headers }));
@@ -170,7 +185,9 @@ async function api(path, options) {
     throw new Error('网络异常，请确认后端服务已启动');
   }
   if (res.status === 401) {
-    doLogout();
+    /* 并发请求时第一个 401 已清会话后，后续旧 token 的 401 不得再清掉新会话：
+       仅当本次请求所用 token 仍是当前存储的 token 才执行退出 */
+    if (reqToken && reqToken === localStorage.getItem('rq_token')) doLogout();
     throw new Error('登录已过期，请重新选择身份登录');
   }
   let data = null;
@@ -193,14 +210,18 @@ function delApi(path) {
 /* multipart 上传专用：不能带 JSON Content-Type，交给浏览器生成 boundary */
 async function uploadApi(path, formData) {
   const headers = {};
-  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  const reqToken = state.token;
+  if (reqToken) headers['Authorization'] = 'Bearer ' + reqToken;
   let res;
   try {
     res = await fetch(path, { method: 'POST', headers: headers, body: formData });
   } catch (e) {
     throw new Error('网络异常，请确认后端服务已启动');
   }
-  if (res.status === 401) { doLogout(); throw new Error('登录已过期，请重新选择身份登录'); }
+  if (res.status === 401) {
+    if (reqToken && reqToken === localStorage.getItem('rq_token')) doLogout();
+    throw new Error('登录已过期，请重新选择身份登录');
+  }
   let data = null;
   try { data = await res.json(); } catch (e) { /* 空响应 */ }
   if (!res.ok) throw new Error((data && data.detail) || ('请求失败（HTTP ' + res.status + '）'));
@@ -356,14 +377,28 @@ const TIER_LOGIN_HINT = {
   developer: '进去后到「数字员工」维护档案，到「协作空间」调试派活',
   staff:     '进去后点「协作空间」，找你的数字员工聊天派活',
 };
+/* 运行环境信息：登录页模式判断 + 驾驶舱 KPI 目标值；老版本后端无此接口时按演示模式处理 */
+let appEnv = null;
+async function fetchEnvironment() {
+  if (appEnv) return appEnv;
+  try {
+    const res = await fetch('/api/environment');
+    if (res.ok) appEnv = await res.json();
+  } catch (e) { /* 接口不存在或网络异常：按演示模式处理 */ }
+  return appEnv;
+}
 async function bootLogin() {
   const box = document.getElementById('login-people');
+  box.innerHTML = '<div class="text-gray-300 flex items-center space-x-2"><span class="spinner"></span><span>正在加载…</span></div>';
+  const env = await fetchEnvironment();
+  try { publicImProviders = await api('/api/auth/providers/public'); }
+  catch (e) { publicImProviders = []; }
+  /* 生产模式：/api/login/people 返回 403，直接走企业 IM 扫码/授权登录 */
+  if (env && env.demo_login_enabled === false) { applyProductionLogin(); return; }
   box.innerHTML = '<div class="text-gray-300 flex items-center space-x-2"><span class="spinner"></span><span>正在加载组织人员…</span></div>';
   try {
     const people = await api('/api/login/people');
     loginPeopleCache = people;
-    try { publicImProviders = await api('/api/auth/providers/public'); }
-    catch (e) { publicImProviders = []; }
     let html = '';
     TIER_ORDER.forEach(function (tier) {
       const group = people.filter(function (p) { return p.tier === tier; });
@@ -386,6 +421,17 @@ async function bootLogin() {
   } catch (e) {
     box.innerHTML = '<div class="text-orange-200 text-sm">' + esc(e.message) + '　<a class="underline cursor-pointer" onclick="bootLogin()">点击重试</a></div>';
   }
+}
+/* 生产模式登录页：收起免密入口与人员选择器，仅保留企业 IM 扫码/授权登录 */
+function applyProductionLogin() {
+  const copy = document.getElementById('login-demo-copy');
+  if (copy) copy.classList.add('hidden');
+  document.getElementById('login-people').innerHTML =
+    '<div class="border border-white/25 bg-white/10 rounded-lg px-4 py-3 text-sm text-gray-100 leading-relaxed">' +
+    '当前为正式环境，免密登录已关闭。请使用下方企业 IM（钉钉 / 飞书）扫码或授权登录；' +
+    '尚未绑定 IM 账号的同事，请联系数字化团队完成绑定后再登录。</div>';
+  const imCopy = document.getElementById('login-im-copy');
+  if (imCopy) imCopy.textContent = '使用已绑定的企业 IM 账号扫码 / 授权登录：';
 }
 async function doLogin(personId) {
   try {
@@ -459,6 +505,11 @@ async function imLogin(provider) {
       return;
     }
   }
+  /* 生产模式未配置真实应用凭证时不提供模拟登录 */
+  if (appEnv && appEnv.demo_login_enabled === false) {
+    toast(meta.label + ' 登录暂未配置，请联系数字化团队完成应用配置后重试', 'error');
+    return;
+  }
   const people = loginPeopleCache || [];
   openModal('<h3 class="font-bold text-primary text-lg mb-1">使用' + meta.label + '账号进入</h3>' +
     '<p class="text-xs text-gray-500 mb-3">真实环境下这里会弹出' + meta.label + '扫码授权；演示环境请直接选择你的身份，' +
@@ -470,20 +521,22 @@ async function imLogin(provider) {
       }).join('') + '</select>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitImLogin(\'' + provider + '\')">模拟' + meta.label + '授权并进入</button></div>');
+      '<button class="btn-primary" id="im-submit" onclick="submitImLogin(' + esc(jsStr(provider)) + ')">模拟' + meta.label + '授权并进入</button></div>');
 }
 async function submitImLogin(provider) {
   const personId = Number(document.getElementById('im-person').value);
   if (!personId) { toast('请选择身份', 'error'); return; }
-  try {
-    /* demo 回调为免 token 的同源 JSON 接口，直接 fetch 完成模拟绑定 */
-    const res = await fetch('/api/auth/oauth/' + provider + '/callback?demo=1&person_id=' + personId);
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.detail || '授权回调失败');
-    closeModal();
-    toast(data.msg || '绑定成功', 'info');
-    doLogin(data.binding.person_id);
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('im-submit'), async function () {
+    try {
+      /* demo 回调为免 token 的同源 JSON 接口，直接 fetch 完成模拟绑定 */
+      const res = await fetch('/api/auth/oauth/' + provider + '/callback?demo=1&person_id=' + personId);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.detail || '授权回调失败');
+      closeModal();
+      toast(data.msg || '绑定成功', 'info');
+      doLogin(data.binding.person_id);
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* 主界面：侧边栏「IM 绑定」弹窗 */
@@ -511,8 +564,8 @@ async function openImBindModal() {
             : '<span class="badge bg-gray-400">未绑定</span>') + '</div>' +
           '<div class="flex space-x-2">' +
             (b
-              ? '<button class="btn-danger-sm" onclick="unbindIm(\'' + pk + '\')">解绑</button>'
-              : '<button class="btn-success-sm" onclick="startImBind(\'' + pk + '\')">绑定</button>') +
+              ? '<button class="btn-danger-sm" onclick="unbindIm(' + esc(jsStr(pk)) + ')">解绑</button>'
+              : '<button class="btn-success-sm" onclick="startImBind(' + esc(jsStr(pk)) + ')">绑定</button>') +
           '</div></div>' +
         (conf && !conf.configured ? '<div class="text-[11px] text-gray-400 mt-1.5">未配置应用凭证，当前为演示模式（配置后自动切换真实扫码授权）</div>' : '') +
         (conf && conf.configured ? '<div class="text-[11px] text-teal mt-1.5">已配置应用凭证，将跳转真实授权</div>' : '') +
@@ -597,14 +650,14 @@ function openProviderConfModal() {
     '<div class="space-y-4">';
   providers.forEach(function (p) {
     const meta = IM_PROVIDER_META[p.provider] || { label: p.provider };
-    html += '<div class="border border-gray-100 rounded-lg p-3.5" id="conf-' + p.provider + '">' +
+    html += '<div class="border border-gray-100 rounded-lg p-3.5" id="conf-' + esc(p.provider) + '">' +
       '<div class="flex items-center justify-between mb-2"><span class="font-bold" style="color:' + (meta.color || '#1a365d') + '">' + meta.label + '</span>' +
       '<label class="inline-flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer"><input type="checkbox" id="cf-' + p.provider + '-enabled" class="accent-secondary"' + (p.enabled ? ' checked' : '') + '>启用</label></div>' +
       '<div class="grid grid-cols-2 gap-2">' +
         '<div><label class="form-label">App ID</label><input id="cf-' + p.provider + '-appid" class="form-input !text-xs" value="' + esc(p.app_id || '') + '"></div>' +
         '<div><label class="form-label">App Secret</label><input id="cf-' + p.provider + '-secret" type="password" class="form-input !text-xs" placeholder="' + (p.app_secret === '已配置' ? '已配置（留空保持不变）' : '填入密钥') + '"></div></div>' +
       '<div class="mt-2"><label class="form-label">回调地址（留空用默认）</label><input id="cf-' + p.provider + '-redirect" class="form-input !text-xs font-mono" value="' + esc(p.redirect_uri || '') + '" placeholder="http://localhost:8000/api/auth/oauth/' + p.provider + '/callback"></div>' +
-      '<div class="flex justify-end mt-2"><button class="btn-primary !py-1 !px-3 !text-xs" onclick="submitProviderConf(\'' + p.provider + '\')">保存' + meta.label + '配置</button></div>' +
+      '<div class="flex justify-end mt-2"><button class="btn-primary !py-1 !px-3 !text-xs" id="cf-' + esc(p.provider) + '-submit" onclick="submitProviderConf(' + esc(jsStr(p.provider)) + ')">保存' + meta.label + '配置</button></div>' +
       '</div>';
   });
   html += '</div><div class="flex justify-end mt-4"><button class="btn-ghost" onclick="openImBindModal()">返回</button></div>';
@@ -618,11 +671,13 @@ async function submitProviderConf(provider) {
   if (appid) body.app_id = appid;
   if (secret) body.app_secret = secret;
   if (redirect) body.redirect_uri = redirect;
-  try {
-    await putApi('/api/auth/providers/' + provider, body);
-    toast((IM_PROVIDER_META[provider] || {}).label + ' 应用凭证已保存');
-    openImBindModal();
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('cf-' + provider + '-submit'), async function () {
+    try {
+      await putApi('/api/auth/providers/' + provider, body);
+      toast((IM_PROVIDER_META[provider] || {}).label + ' 应用凭证已保存');
+      openImBindModal();
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* ==================== 心跳 ==================== */
@@ -644,8 +699,17 @@ async function runHeartbeat() {
 }
 
 /* ==================== 视图 1：驾驶舱 ==================== */
+/* KPI 目标值默认值：/api/environment 的 kpi_targets 可覆盖；接口无此字段时行为与硬编码一致 */
+const KPI_TARGET_DEFAULTS = {
+  coverage: '≥70%', acceptance_rate: '≥85%', active_rate: '≥60%', accuracy: '≥95%', annual_benefit: '¥79万',
+};
 async function renderDashboard(c) {
   c.innerHTML = skeletonHtml(5);
+  await fetchEnvironment();
+  const kt = (appEnv && appEnv.kpi_targets) || {};
+  const ktarget = function (key) {
+    return (kt[key] != null && kt[key] !== '') ? String(kt[key]) : KPI_TARGET_DEFAULTS[key];
+  };
   const d = await api('/api/metrics/dashboard');
   const k = d.kpi || {};
   /* kpi 每项为 {value, note} 结构（note 为口径说明） */
@@ -653,12 +717,12 @@ async function renderDashboard(c) {
   const knote = function (x) { return (x && typeof x === 'object' && x.note) ? x.note : ''; };
   const kpis = [
     { label: '试点覆盖率',     v: kval(k.trial_coverage) + '%', sub: '试点中+已验收场景占比', color: 'text-secondary', note: knote(k.trial_coverage) },
-    { label: '验收覆盖率',     v: kval(k.coverage) + '%',       sub: '方案口径 · 目标 ≥70%',  color: 'text-gray-500',  note: knote(k.coverage) },
-    { label: '验收通过率',     v: kval(k.acceptance_rate) + '%', sub: '目标 ≥85%',            color: 'text-success',   note: knote(k.acceptance_rate) },
-    { label: '活跃使用率(7日)', v: kval(k.active_rate) + '%',    sub: '目标 ≥60%',            color: 'text-teal',      note: knote(k.active_rate) },
+    { label: '验收覆盖率',     v: kval(k.coverage) + '%',       sub: '方案口径 · 目标 ' + ktarget('coverage'),  color: 'text-gray-500',  note: knote(k.coverage) },
+    { label: '验收通过率',     v: kval(k.acceptance_rate) + '%', sub: '目标 ' + ktarget('acceptance_rate'),    color: 'text-success',   note: knote(k.acceptance_rate) },
+    { label: '活跃使用率(7日)', v: kval(k.active_rate) + '%',    sub: '目标 ' + ktarget('active_rate'),        color: 'text-teal',      note: knote(k.active_rate) },
     { label: '累计节省工时',   v: fmtNum(kval(k.hours_saved)) + ' h',   sub: '数字员工产出',   color: 'text-accent',    note: knote(k.hours_saved) },
-    { label: '交付准确率',     v: kval(k.accuracy) + '%',       sub: '目标 ≥95%',             color: 'text-secondary', note: knote(k.accuracy) },
-    { label: '年化综合收益',   v: '¥' + fmtWan(kval(k.annual_benefit)), sub: '目标 ¥79万',     color: 'text-success',   note: knote(k.annual_benefit) },
+    { label: '交付准确率',     v: kval(k.accuracy) + '%',       sub: '目标 ' + ktarget('accuracy'),            color: 'text-secondary', note: knote(k.accuracy) },
+    { label: '年化综合收益',   v: '¥' + fmtWan(kval(k.annual_benefit)), sub: '目标 ' + ktarget('annual_benefit'), color: 'text-success', note: knote(k.annual_benefit) },
     { label: 'Skill 复用数',   v: fmtNum(kval(k.reuse_count)),  sub: '被引用去重',            color: 'text-primary',   note: knote(k.reuse_count) },
   ];
   const inv = d.investment || { year1: 0, breakdown: {}, breakdown_detail: {} };
@@ -874,7 +938,7 @@ async function loadWorkspacePanel() {
     '</div>' +
     '<div class="flex space-x-1">' +
     Object.keys(ZONE_META).map(function (key) {
-      return '<div class="zone-tab ' + (key === wsState.zone ? 'active' : '') + '" onclick="switchZone(\'' + key + '\')">' + ZONE_META[key].name + '</div>';
+      return '<div class="zone-tab ' + (key === wsState.zone ? 'active' : '') + '" onclick="switchZone(' + esc(jsStr(key)) + ')">' + ZONE_META[key].name + '</div>';
     }).join('') +
     '</div></div>' +
     '<div class="px-4 py-1.5 bg-teal/5 text-xs text-teal border-b border-gray-100 shrink-0">💡 ' + esc(z.name) + '：' + esc(z.desc) + '</div>' +
@@ -899,7 +963,7 @@ async function loadWorkspacePanel() {
       '<div id="dispatch-hint" class="hidden text-xs text-accent font-medium mb-1.5"></div>' +
       '<div class="flex items-end space-x-2">' +
         '<textarea id="ws-input" class="form-textarea flex-1" rows="2" placeholder="' + esc(z.ph || '输入消息，Enter 发送') + '"></textarea>' +
-        '<button class="btn-primary shrink-0" onclick="sendWsMessage()">发送</button>' +
+        '<button class="btn-primary shrink-0" id="ws-send" onclick="sendWsMessage()">发送</button>' +
       '</div></div>';
   panel.innerHTML = html;
   const ta = document.getElementById('ws-input');
@@ -1089,7 +1153,7 @@ function onWsInput(e) {
     const cands = wsState.members.filter(function (x) { return x.member_type === 'agent' && x.name.indexOf(q) >= 0; });
     if (cands.length) {
       pop.innerHTML = cands.map(function (a) {
-        return '<div class="at-item" onclick="insertAt(\'' + esc(a.name) + '\')">' +
+        return '<div class="at-item" onclick="insertAt(' + esc(jsStr(a.name)) + ')">' +
           '<span class="w-6 h-6 rounded bg-teal text-white flex items-center justify-center shrink-0"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v3M5 8h14a1 1 0 011 1v9a2 2 0 01-2 2H6a2 2 0 01-2-2V9a1 1 0 011-1zM9 13v2M15 13v2"/></svg></span>' +
           '<span>' + esc(a.name) + '</span><span class="text-xs text-gray-400">数字员工</span></div>';
       }).join('');
@@ -1137,34 +1201,36 @@ async function sendWsMessage() {
   const ta = document.getElementById('ws-input');
   const content = (ta.value || '').trim();
   if (!content) return;
-  try {
-    const modeEl = document.getElementById('ws-interaction-mode');
-    const targetEl = document.getElementById('ws-target-agent');
-    const body = { content: content, zone: wsState.zone };
-    if (wsState.zone === 'agent') {
-      body.interaction_mode = modeEl ? modeEl.value : wsState.interactionMode;
-      if (targetEl && targetEl.value) body.target_agent_id = Number(targetEl.value);
-    }
-    const r = await postApi('/api/workspaces/' + wsState.id + '/messages', body);
-    ta.value = '';
-    updateDispatchHint();
-    const n = (r.dispatched || []).length;
-    if (n) toast('已派发任务给：' + r.dispatched.map(function (d) { return d.agent_name; }).join('、'), 'info');
-    const replies = r.replies || [];
-    if (replies.length) {
-      const ok = replies.filter(function (x) { return x.model_info && x.model_info.ok; }).length;
-      toast(ok
-        ? replies.map(function (x) { return x.agent_name; }).join('、') + ' 已完成真实模型回复'
-        : '模型未完成回复，请查看对话中的原因', ok ? 'info' : 'error');
-    }
-    if (r.chat_error) toast(r.chat_error, 'error');
-    /* R5 兜底：无可用数字员工时明确告知，需求已登记为待处理任务 */
-    if (r.undispatched) {
-      toast('数字员工暂时不可用，已登记待处理需求 #' + r.undispatched.pending_task_id +
-        '，可在任务中心跟进', 'error');
-    }
-    await loadMessages(n > 0 || replies.length > 0 || !!r.undispatched);
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('ws-send'), async function () {
+    try {
+      const modeEl = document.getElementById('ws-interaction-mode');
+      const targetEl = document.getElementById('ws-target-agent');
+      const body = { content: content, zone: wsState.zone };
+      if (wsState.zone === 'agent') {
+        body.interaction_mode = modeEl ? modeEl.value : wsState.interactionMode;
+        if (targetEl && targetEl.value) body.target_agent_id = Number(targetEl.value);
+      }
+      const r = await postApi('/api/workspaces/' + wsState.id + '/messages', body);
+      ta.value = '';
+      updateDispatchHint();
+      const n = (r.dispatched || []).length;
+      if (n) toast('已派发任务给：' + r.dispatched.map(function (d) { return d.agent_name; }).join('、'), 'info');
+      const replies = r.replies || [];
+      if (replies.length) {
+        const ok = replies.filter(function (x) { return x.model_info && x.model_info.ok; }).length;
+        toast(ok
+          ? replies.map(function (x) { return x.agent_name; }).join('、') + ' 已完成真实模型回复'
+          : '模型未完成回复，请查看对话中的原因', ok ? 'info' : 'error');
+      }
+      if (r.chat_error) toast(r.chat_error, 'error');
+      /* R5 兜底：无可用数字员工时明确告知，需求已登记为待处理任务 */
+      if (r.undispatched) {
+        toast('数字员工暂时不可用，已登记待处理需求 #' + r.undispatched.pending_task_id +
+          '，可在任务中心跟进', 'error');
+      }
+      await loadMessages(n > 0 || replies.length > 0 || !!r.undispatched);
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 /* 审核（协作空间内） */
 async function reviewTaskAction(taskId, action, comment) {
@@ -1446,7 +1512,7 @@ function openModelKeyModal() {
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
       '<button class="btn-ghost" onclick="testModelConn()">测试连接</button>' +
-      '<button class="btn-primary" onclick="submitModelKey()">保存配置</button></div>');
+      '<button class="btn-primary" id="mk-submit" onclick="submitModelKey()">保存配置</button></div>');
   fillModelKeyForm();
 }
 function fillModelKeyForm() {
@@ -1488,17 +1554,19 @@ async function submitModelKey() {
   if (model) body.default_model = model;
   if (temp) body.temperature = parseFloat(temp);
   if (timeout) body.timeout = parseInt(timeout, 10);
-  try {
-    await putApi('/api/models/' + key, body);
-    closeModal();
-    toast('模型供应商配置已保存');
-    await ensureModelsCache(true);
-    renderModelDefaultCard();
-    if (drawerAgentId && document.getElementById('agent-model-box')) {
-      const a = await api('/api/agents/' + drawerAgentId);
-      document.getElementById('agent-model-box').innerHTML = agentModelBoxHtml(a);
-    }
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('mk-submit'), async function () {
+    try {
+      await putApi('/api/models/' + key, body);
+      closeModal();
+      toast('模型供应商配置已保存');
+      await ensureModelsCache(true);
+      renderModelDefaultCard();
+      if (drawerAgentId && document.getElementById('agent-model-box')) {
+        const a = await api('/api/agents/' + drawerAgentId);
+        document.getElementById('agent-model-box').innerHTML = agentModelBoxHtml(a);
+      }
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* ---------- R4-2：新建 / 编辑数字员工 ---------- */
@@ -1541,7 +1609,7 @@ async function openAgentFormModal(agentId) {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitAgentForm(' + (a ? a.id : 0) + ')">' + (a ? '保存修改' : '创建') + '</button></div>');
+      '<button class="btn-primary" id="af-submit" onclick="submitAgentForm(' + (a ? a.id : 0) + ')">' + (a ? '保存修改' : '创建') + '</button></div>');
 }
 async function submitAgentForm(agentId) {
   const body = {
@@ -1554,21 +1622,23 @@ async function submitAgentForm(agentId) {
     mcp_ids: Array.prototype.map.call(document.querySelectorAll('input[name="af-mcp"]:checked'), function (el) { return Number(el.value); }),
   };
   if (!body.name) { toast('请填写名称', 'error'); return; }
-  try {
-    if (agentId) {
-      await patchApi('/api/agents/' + agentId, body);
-      closeModal();
-      toast('数字员工档案已更新');
-      openAgentDrawer(agentId);
-    } else {
-      const r = await postApi('/api/agents', body);
-      closeModal();
-      toast('数字员工「' + r.name + '」已创建（' + (r.code || '') + '）');
-      cache.agents = null;   // 让协作空间 @ 候选等用到缓存的地方下次重新拉取
-    }
-    const grid = document.getElementById('agents-grid');
-    if (grid) loadAgents();
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('af-submit'), async function () {
+    try {
+      if (agentId) {
+        await patchApi('/api/agents/' + agentId, body);
+        closeModal();
+        toast('数字员工档案已更新');
+        openAgentDrawer(agentId);
+      } else {
+        const r = await postApi('/api/agents', body);
+        closeModal();
+        toast('数字员工「' + r.name + '」已创建（' + (r.code || '') + '）');
+        cache.agents = null;   // 让协作空间 @ 候选等用到缓存的地方下次重新拉取
+      }
+      const grid = document.getElementById('agents-grid');
+      if (grid) loadAgents();
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* ==================== 视图 4：场景库（R4-5：平台/部门分组 + 推荐排序） ==================== */
@@ -1736,7 +1806,7 @@ async function openScenarioModal() {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitScenario()">提交申报</button></div>');
+      '<button class="btn-primary" id="ns-submit" onclick="submitScenario()">提交申报</button></div>');
 }
 async function submitScenario() {
   const body = {
@@ -1748,12 +1818,14 @@ async function submitScenario() {
     actions: document.getElementById('ns-actions').value.split('\n').map(function (s) { return s.trim(); }).filter(Boolean),
   };
   if (!body.name) { toast('请填写场景名称', 'error'); return; }
-  try {
-    await postApi('/api/scenarios', body);
-    closeModal();
-    toast('场景申报成功，待敏捷立项');
-    loadScenarios();
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('ns-submit'), async function () {
+    try {
+      await postApi('/api/scenarios', body);
+      closeModal();
+      toast('场景申报成功，待敏捷立项');
+      loadScenarios();
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* ==================== 视图 5：任务中心 ==================== */
@@ -1826,7 +1898,7 @@ async function openTaskModal() {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitTask()">创建</button></div>');
+      '<button class="btn-primary" id="nt-submit" onclick="submitTask()">创建</button></div>');
 }
 async function submitTask() {
   const body = {
@@ -1836,13 +1908,15 @@ async function submitTask() {
   const agentId = Number(document.getElementById('nt-agent').value);
   if (agentId) body.agent_id = agentId;
   if (!body.title) { toast('请填写任务标题', 'error'); return; }
-  try {
-    const r = await postApi('/api/tasks', body);
-    closeModal();
-    if (r && r.hint) toast(r.hint, 'info');
-    else toast(agentId ? '任务已创建，数字员工已完成执行，待审核' : '任务已创建');
-    renderTasks(document.getElementById('view-container'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('nt-submit'), async function () {
+    try {
+      const r = await postApi('/api/tasks', body);
+      closeModal();
+      if (r && r.hint) toast(r.hint, 'info');
+      else toast(agentId ? '任务已创建，数字员工已完成执行，待审核' : '任务已创建');
+      renderTasks(document.getElementById('view-container'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 function openTaskReviewModal(id) {
   const t = taskCache.find(function (x) { return x.id === id; });
@@ -1936,7 +2010,7 @@ async function renderSkills(c) {
           '<td class="text-xs text-gray-500 max-w-md">' + esc(m.description || '-') + '</td>' +
           '<td>' + statusBadge(m.status, { '启用': 'bg-success', '停用': 'bg-gray-400' }) + '</td>' +
           (canAdmin()
-            ? '<td class="whitespace-nowrap"><button class="btn-ghost !py-0.5 !px-2 !text-xs" onclick="toggleMcp(' + m.id + ',\'' + esc(m.status) + '\')">' +
+            ? '<td class="whitespace-nowrap"><button class="btn-ghost !py-0.5 !px-2 !text-xs" onclick="toggleMcp(' + m.id + ',' + esc(jsStr(m.status)) + ')">' +
               (m.status === '启用' ? '停用' : '启用') + '</button></td>'
             : '') + '</tr>';
       }).join('') + '</tbody></table></div>';
@@ -1964,7 +2038,7 @@ function openSkillModal(s) {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitSkill(' + (editing ? s.id : 0) + ')">' + (editing ? '保存修改' : '创建') + '</button></div>');
+      '<button class="btn-primary" id="sk-submit" onclick="submitSkill(' + (editing ? s.id : 0) + ')">' + (editing ? '保存修改' : '创建') + '</button></div>');
 }
 async function submitSkill(id) {
   const body = {
@@ -1974,12 +2048,14 @@ async function submitSkill(id) {
     description: document.getElementById('sk-desc').value.trim(),
   };
   if (!body.name) { toast('请填写 Skill 名称', 'error'); return; }
-  try {
-    if (id) { await patchApi('/api/skills/' + id, body); toast('Skill 已更新'); }
-    else { await postApi('/api/skills', body); toast('Skill 已创建'); }
-    closeModal();
-    renderSkills(document.getElementById('view-container'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('sk-submit'), async function () {
+    try {
+      if (id) { await patchApi('/api/skills/' + id, body); toast('Skill 已更新'); }
+      else { await postApi('/api/skills', body); toast('Skill 已创建'); }
+      closeModal();
+      renderSkills(document.getElementById('view-container'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 function openSkillDelete(id) {
   const s = (cache.skills || []).find(function (x) { return x.id === id; });
@@ -1989,15 +2065,17 @@ function openSkillDelete(id) {
     '<p class="text-xs text-gray-400">该操作会写入审计日志。</p>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-danger-sm !px-5 !py-2" onclick="submitSkillDelete(' + id + ')">确认删除</button></div>');
+      '<button class="btn-danger-sm !px-5 !py-2" id="sk-del-submit" onclick="submitSkillDelete(' + id + ')">确认删除</button></div>');
 }
 async function submitSkillDelete(id) {
-  try {
-    await delApi('/api/skills/' + id);
-    closeModal();
-    toast('Skill 已删除');
-    renderSkills(document.getElementById('view-container'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('sk-del-submit'), async function () {
+    try {
+      await delApi('/api/skills/' + id);
+      closeModal();
+      toast('Skill 已删除');
+      renderSkills(document.getElementById('view-container'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 /* MCP 台账：新增 / 启停 */
 function openMcpModal() {
@@ -2009,7 +2087,7 @@ function openMcpModal() {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitMcp()">登记</button></div>');
+      '<button class="btn-primary" id="mc-submit" onclick="submitMcp()">登记</button></div>');
 }
 async function submitMcp() {
   const body = {
@@ -2018,12 +2096,14 @@ async function submitMcp() {
     description: document.getElementById('mc-desc').value.trim(),
   };
   if (!body.name || !body.endpoint) { toast('请填写名称与接入点', 'error'); return; }
-  try {
-    await postApi('/api/mcp', body);
-    closeModal();
-    toast('MCP 服务已登记（默认停用，确认可用后再启用）');
-    renderSkills(document.getElementById('view-container'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('mc-submit'), async function () {
+    try {
+      await postApi('/api/mcp', body);
+      closeModal();
+      toast('MCP 服务已登记（默认停用，确认可用后再启用）');
+      renderSkills(document.getElementById('view-container'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 async function toggleMcp(id, current) {
   const next = current === '启用' ? '停用' : '启用';
@@ -2067,7 +2147,7 @@ async function renderKnowledge(c) {
         '<span class="font-bold text-primary">' + esc(s.name) + '</span>' +
         '<span class="badge bg-teal">' + (s.doc_count ?? 0) + ' 文档</span></div>' +
       '<div class="text-xs text-gray-500 space-y-0.5">' +
-        '<div>设备：' + esc(s.device || '群晖DS925+') + ' · 容量 ' + esc(s.capacity || '-') + '</div>' +
+        '<div>设备：' + esc(s.device || NAS_DEFAULT_DEVICE) + ' · 容量 ' + esc(s.capacity || '-') + '</div>' +
         '<div>所属：' + esc(s.dept_name || '-') + ' · 领域：' + esc(s.domain || '-') + '</div></div></div>';
   });
   html += '</div>';
@@ -2185,45 +2265,22 @@ async function openDocDetail(id) {
             '<span class="font-bold text-secondary">' + esc(ds.sheet_name) + '</span>' +
             '<code class="text-gray-400">' + esc(ds.table_name) + '</code>' +
             '<span>' + ds.row_count + ' 行 × ' + ds.column_count + ' 列</span><span class="flex-1"></span>' +
-            '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="previewDocDataset(' + d.id + ',\'' + esc(ds.table_name) + '\')">预览</button>' +
+            '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="previewDocDataset(' + d.id + ',' + esc(jsStr(ds.table_name)) + ')">预览</button>' +
             (d.converted_format === 'sqlite+csv'
-              ? '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="downloadDatasetCsv(' + d.id + ',\'' + esc(ds.table_name) + '\')">CSV</button>'
+              ? '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="downloadDatasetCsv(' + d.id + ',' + esc(jsStr(ds.table_name)) + ')">CSV</button>'
               : '') + '</div>';
         }).join('') + '</div></div>';
     }
     html += '<div class="flex justify-end space-x-2 mt-2">' +
       '<button class="btn-ghost" onclick="closeModal()">关闭</button>' +
       (d.converted_format
-        ? '<button class="btn-primary" onclick="downloadDocFile(' + d.id + ',\'' + esc(d.converted_format) + '\')">下载转换产物</button>'
+        ? '<button class="btn-primary" onclick="downloadDocFile(' + d.id + ',' + esc(jsStr(d.converted_format)) + ')">下载转换产物</button>'
         : '') + '</div>';
     openModal(html);
   } catch (e) { openModal(errorHtml(e.message)); }
 }
-/* 下载转换产物：接口需带 token，走 fetch→blob→本地下载 */
-async function downloadDocFile(id, format) {
-  const ext = { md: '.md', html: '.html', sqlite: '.md', 'sqlite+csv': '.md' }[format] || '.txt';
-  try {
-    const res = await fetch('/api/knowledge/documents/' + id + '/file', {
-      headers: state.token ? { 'Authorization': 'Bearer ' + state.token } : {},
-    });
-    if (!res.ok) {
-      let data = null;
-      try { data = await res.json(); } catch (e) { /* 非 JSON */ }
-      throw new Error((data && data.detail) || ('下载失败（HTTP ' + res.status + '）'));
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'document_' + id + ext;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
-    toast('转换产物已开始下载');
-  } catch (e) { toast(e.message, 'error'); }
-}
-async function downloadProtected(url, filename) {
+/* 带鉴权下载统一入口：fetch→blob→a 标签触发；appendChild 挂载 + 延时 revoke/remove 兼容 Firefox */
+async function downloadBlob(url, filename) {
   const res = await fetch(url, {
     headers: state.token ? { 'Authorization': 'Bearer ' + state.token } : {},
   });
@@ -2235,18 +2292,29 @@ async function downloadProtected(url, filename) {
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = objectUrl; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 3000);
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(objectUrl); a.remove(); }, 3000);
+}
+/* 下载转换产物：接口需带 token，走 fetch→blob→本地下载 */
+async function downloadDocFile(id, format) {
+  const ext = { md: '.md', html: '.html', sqlite: '.md', 'sqlite+csv': '.md' }[format] || '.txt';
+  try {
+    await downloadBlob('/api/knowledge/documents/' + id + '/file', 'document_' + id + ext);
+    toast('转换产物已开始下载');
+  } catch (e) { toast(e.message, 'error'); }
 }
 async function downloadDatasetDb(id) {
   try {
-    await downloadProtected('/api/knowledge/documents/' + id + '/database', 'document_' + id + '.db');
+    await downloadBlob('/api/knowledge/documents/' + id + '/database', 'document_' + id + '.db');
     toast('SQLite 数据库已开始下载');
   } catch (e) { toast(e.message, 'error'); }
 }
 async function downloadDatasetCsv(id, tableName) {
   try {
-    await downloadProtected('/api/knowledge/documents/' + id + '/datasets/' + encodeURIComponent(tableName) + '/csv', tableName + '.csv');
+    await downloadBlob('/api/knowledge/documents/' + id + '/datasets/' + encodeURIComponent(tableName) + '/csv', tableName + '.csv');
     toast('CSV 已开始下载');
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2298,22 +2366,24 @@ function openDocModal() {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitDoc()">登记</button></div>');
+      '<button class="btn-primary" id="nd-submit" onclick="submitDoc()">登记</button></div>');
 }
 async function submitDoc() {
   const title = document.getElementById('nd-title').value.trim();
   if (!title) { toast('请填写文档标题', 'error'); return; }
-  try {
-    await postApi('/api/knowledge/documents', {
-      space_id: knState.spaceId,
-      title: title,
-      level: document.getElementById('nd-level').value,
-      tags: document.getElementById('nd-tags').value.trim(),
-    });
-    closeModal();
-    toast('文档登记成功');
-    await renderKnowledge(document.getElementById('view-container'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('nd-submit'), async function () {
+    try {
+      await postApi('/api/knowledge/documents', {
+        space_id: knState.spaceId,
+        title: title,
+        level: document.getElementById('nd-level').value,
+        tags: document.getElementById('nd-tags').value.trim(),
+      });
+      closeModal();
+      toast('文档登记成功');
+      await renderKnowledge(document.getElementById('view-container'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* ==================== 视图 8：组织通讯录 ==================== */
@@ -2429,7 +2499,7 @@ async function renderGovernance(c) {
   c.innerHTML = '<div class="data-card !p-0">' +
     '<div class="flex px-4 pt-3 border-b border-gray-100 space-x-1 flex-wrap">' +
     tabs.map(function (t) {
-      return '<div class="zone-tab ' + (govState.tab === t.key ? 'active' : '') + '" onclick="switchGovTab(\'' + t.key + '\')">' + t.name +
+      return '<div class="zone-tab ' + (govState.tab === t.key ? 'active' : '') + '" onclick="switchGovTab(' + esc(jsStr(t.key)) + ')">' + t.name +
         (t.key === 'reimbursements' && pendCount > 0 ? ' <span class="badge bg-danger">' + pendCount + '</span>' : '') + '</div>';
     }).join('') + '</div>' +
     '<div id="gov-body" class="p-4">' + loadingHtml() + '</div></div>';
@@ -2487,21 +2557,34 @@ async function renderIncentives(box) {
 function incentiveActions(x) {
   if (!state.person || ['boss', 'coach'].indexOf(state.person.tier) < 0) return '<span class="text-gray-300">—</span>';
   if (x.status === '申报中') {
-    return '<button class="btn-success-sm" onclick="reviewIncentive(' + x.id + ',\'approve\')">评定</button> ' +
-      '<button class="btn-danger-sm" onclick="reviewIncentive(' + x.id + ',\'reject\')">驳回</button>';
+    return '<button class="btn-success-sm" onclick="openIncentiveReviewModal(' + x.id + ',\'approve\')">评定</button> ' +
+      '<button class="btn-danger-sm" onclick="openIncentiveReviewModal(' + x.id + ',\'reject\')">驳回</button>';
   }
   if (x.status === '已评定') {
-    return '<button class="btn-success-sm" onclick="reviewIncentive(' + x.id + ',\'release\')">确认发放</button>';
+    return '<button class="btn-success-sm" onclick="openIncentiveReviewModal(' + x.id + ',\'release\')">确认发放</button>';
   }
   return '<span class="text-gray-300">—</span>';
 }
-async function reviewIncentive(id, action) {
-  const labels = { approve: '评定通过', reject: '驳回', release: '确认发放' };
-  const comment = window.prompt((labels[action] || action) + '，请输入意见（可留空）', '') ;
-  if (comment === null) return;
+const INCENTIVE_ACTION_LABEL = { approve: '评定通过', reject: '驳回', release: '确认发放' };
+/* 激励审批意见：openModal 模态框（替代原生 window.prompt） */
+function openIncentiveReviewModal(id, action) {
+  const label = INCENTIVE_ACTION_LABEL[action] || action;
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">' + label + ' · 激励申报 #' + id + '</h3>' +
+    '<label class="form-label">审批意见（可留空）</label>' +
+    '<textarea id="ir-comment" class="form-textarea" rows="3" placeholder="请输入审批意见"></textarea>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitIncentiveReview(' + id + ',\'' + action + '\')">确认' + label + '</button></div>');
+}
+function submitIncentiveReview(id, action) {
+  const comment = document.getElementById('ir-comment').value.trim();
+  closeModal();
+  reviewIncentive(id, action, comment);
+}
+async function reviewIncentive(id, action, comment) {
   try {
-    await postApi('/api/governance/incentives/' + id + '/review', { action: action, comment: comment });
-    toast(labels[action] + '成功');
+    await postApi('/api/governance/incentives/' + id + '/review', { action: action, comment: comment || '' });
+    toast((INCENTIVE_ACTION_LABEL[action] || action) + '成功');
     renderIncentives(document.getElementById('gov-body'));
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2523,7 +2606,7 @@ function openIncentiveModal() {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitIncentive()">提交申报</button></div>');
+      '<button class="btn-primary" id="ni-submit" onclick="submitIncentive()">提交申报</button></div>');
   updateIncentiveTierHint();
 }
 async function submitIncentive() {
@@ -2534,11 +2617,13 @@ async function submitIncentive() {
     amount: Number(document.getElementById('ni-amount').value) || 0,
   };
   if (!body.nominee) { toast('请填写申报人', 'error'); return; }
-  try {
-    await postApi('/api/governance/incentives', body);
-    closeModal(); toast('激励申报已提交');
-    renderIncentives(document.getElementById('gov-body'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('ni-submit'), async function () {
+    try {
+      await postApi('/api/governance/incentives', body);
+      closeModal(); toast('激励申报已提交');
+      renderIncentives(document.getElementById('gov-body'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 async function renderReimbursements(box) {
   const list = await api('/api/governance/reimbursements');
@@ -2589,7 +2674,7 @@ function openReimbModal() {
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
-      '<button class="btn-primary" onclick="submitReimb()">提交申报</button></div>');
+      '<button class="btn-primary" id="nr-submit" onclick="submitReimb()">提交申报</button></div>');
 }
 async function submitReimb() {
   const body = {
@@ -2598,11 +2683,13 @@ async function submitReimb() {
     amount: Number(document.getElementById('nr-amount').value) || 0,
   };
   if (!body.provider) { toast('请填写服务商', 'error'); return; }
-  try {
-    await postApi('/api/governance/reimbursements', body);
-    closeModal(); toast('报销申报已提交，进入平台长审批');
-    renderReimbursements(document.getElementById('gov-body'));
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('nr-submit'), async function () {
+    try {
+      await postApi('/api/governance/reimbursements', body);
+      closeModal(); toast('报销申报已提交，进入平台长审批');
+      renderReimbursements(document.getElementById('gov-body'));
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 async function approveReimb(id, action, comment) {
   try {
@@ -2642,15 +2729,7 @@ async function renderAudits(box) {
 }
 async function downloadAuditCsv() {
   try {
-    const res = await fetch('/api/governance/audits/export', {
-      headers: { Authorization: 'Bearer ' + state.token }
-    });
-    if (!res.ok) throw new Error('导出失败（HTTP ' + res.status + '）');
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'rongqi-audits.csv'; a.click();
-    URL.revokeObjectURL(url);
+    await downloadBlob('/api/governance/audits/export', 'rongqi-audits.csv');
   } catch (e) { toast(e.message, 'error'); }
 }
 async function renderRedlines(box) {
@@ -2894,13 +2973,13 @@ function swimlaneHtml(d) {
 function flowNodeCard(n, delayed) {
   const cls = FLOW_NODE_CLS[n.status] || 'fn-todo';
   const isDelay = delayed.indexOf(n.code) >= 0;
-  return '<div class="flow-node ' + cls + (n.is_critical ? ' fn-critical' : '') + '" onclick="openFlowNode(\'' + n.code + '\')"' +
+  return '<div class="flow-node ' + cls + (n.is_critical ? ' fn-critical' : '') + '" onclick="openFlowNode(' + esc(jsStr(n.code)) + ')"' +
     ' title="' + esc(n.title + (n.outputs ? '\n产出物：' + n.outputs : '') + '\n点击查看详情') + '">' +
     (isDelay ? '<span class="fn-delay" title="关键路径延迟预警"></span>' : '') +
     '<div class="flex items-center gap-1">' +
-      '<span class="font-bold text-[11px] text-primary">' + n.code + '</span>' +
+      '<span class="font-bold text-[11px] text-primary">' + esc(n.code) + '</span>' +
       '<span>' + (FLOW_EXEC_ICON[n.exec_type] || '') + '</span>' +
-      (n.gate_code ? '<span class="fn-gate-badge">⛳' + n.gate_code + '</span>' : '') +
+      (n.gate_code ? '<span class="fn-gate-badge">⛳' + esc(n.gate_code) + '</span>' : '') +
       '<span class="flex-1"></span>' +
       '<span class="fn-status">' + esc(n.status) + '</span></div>' +
     '<div class="fn-title">' + esc(n.title) + '</div></div>';
@@ -2919,8 +2998,8 @@ function openFlowNode(code) {
   const gateRec = n.gate_code ? (d.gate_records || []).find(function (g) { return g.gate === n.gate_code; }) : null;
   let html = '<div class="p-5">' +
     '<div class="flex items-center justify-between mb-3">' +
-      '<div class="flex items-center gap-2 flex-wrap"><span class="text-lg font-black text-primary">' + n.code + '</span>' +
-      (n.gate_code ? '<span class="fn-gate-badge !text-xs">⛳阶段门 ' + n.gate_code + '</span>' : '') +
+      '<div class="flex items-center gap-2 flex-wrap"><span class="text-lg font-black text-primary">' + esc(n.code) + '</span>' +
+      (n.gate_code ? '<span class="fn-gate-badge !text-xs">⛳阶段门 ' + esc(n.gate_code) + '</span>' : '') +
       (n.is_critical ? '<span class="badge bg-accent">关键路径</span>' : '') + '</div>' +
       '<button onclick="closeDrawer()" class="text-gray-400 hover:text-gray-600 shrink-0" title="关闭">' +
         '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg></button></div>' +
@@ -2944,15 +3023,15 @@ function openFlowNode(code) {
   html += '<div class="mt-4">';
   if (n.status === '待确认' && !n.gate_code) {
     html += canConfirmFlow()
-      ? '<button class="btn-primary w-full" onclick="openNodeConfirmModal(\'' + n.code + '\')">确认生效</button>'
+      ? '<button class="btn-primary w-full" onclick="openNodeConfirmModal(' + esc(jsStr(n.code)) + ')">确认生效</button>'
       : '<div class="text-xs text-gray-500">AI 已起草完成，需骨干及以上同事确认生效。</div>';
   } else if (n.status === '进行中' && n.exec_type === 'human' && !n.gate_code) {
     html += canConfirmFlow()
-      ? '<button class="btn-primary w-full" onclick="openNodeConfirmModal(\'' + n.code + '\')">标记完成</button>'
+      ? '<button class="btn-primary w-full" onclick="openNodeConfirmModal(' + esc(jsStr(n.code)) + ')">标记完成</button>'
       : '<div class="text-xs text-gray-500">该节点需人工完成，完成后由骨干及以上同事标记。</div>';
   } else if (n.status === '待签核' && n.gate_code) {
     html += canSignGate(n.gate_code)
-      ? '<button class="btn-primary w-full" onclick="openGateSignModal(\'' + n.gate_code + '\')">签核通过</button>'
+      ? '<button class="btn-primary w-full" onclick="openGateSignModal(' + esc(jsStr(n.gate_code)) + ')">签核通过</button>'
       : '<div class="text-xs text-gray-500">' + (n.gate_code === 'G3' ? '需骨干及以上签核（G3 开放教练团/业务骨干）。' : '需决策层签核。') + '</div>';
   } else if (n.status === '已锁定') {
     html += '<div class="text-xs text-gray-500">🔒 ' + esc(flowLockReason(n)) + '</div>';
@@ -2969,40 +3048,44 @@ function openFlowNode(code) {
 function openNodeConfirmModal(code) {
   const d = flowState.data;
   const n = d.nodes.find(function (x) { return x.code === code; });
-  openModal('<h3 class="font-bold text-primary text-lg mb-1">' + (n.exec_type === 'hybrid' ? '确认生效' : '标记完成') + ' · ' + code + '</h3>' +
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">' + (n.exec_type === 'hybrid' ? '确认生效' : '标记完成') + ' · ' + esc(code) + '</h3>' +
     '<div class="text-sm text-gray-600 mb-3">' + esc(n.title) + '</div>' +
     '<label class="form-label">备注（可选，会写进节点记录）</label>' +
     '<textarea id="fc-comment" class="form-textarea" rows="3" placeholder="如：UAT 反馈已核对，同意生效"></textarea>' +
     '<div class="flex justify-end space-x-2 mt-4"><button class="btn-ghost" onclick="closeModal()">取消</button>' +
-    '<button class="btn-primary" onclick="submitNodeConfirm(\'' + code + '\')">提交</button></div>');
+    '<button class="btn-primary" id="fc-submit" onclick="submitNodeConfirm(' + esc(jsStr(code)) + ')">提交</button></div>');
 }
 async function submitNodeConfirm(code) {
   const comment = document.getElementById('fc-comment').value.trim();
-  try {
-    await postApi('/api/flows/' + flowState.id + '/nodes/' + code + '/confirm', { comment: comment });
-    closeModal();
-    toast(code + ' 已确认生效');
-    route();
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('fc-submit'), async function () {
+    try {
+      await postApi('/api/flows/' + flowState.id + '/nodes/' + encodeURIComponent(code) + '/confirm', { comment: comment });
+      closeModal();
+      toast(code + ' 已确认生效');
+      route();
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* 阶段门签核弹窗 */
 function openGateSignModal(gate) {
-  openModal('<h3 class="font-bold text-primary text-lg mb-1">阶段门签核 · ' + gate + '</h3>' +
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">阶段门签核 · ' + esc(gate) + '</h3>' +
     '<div class="text-sm text-gray-600 mb-3">签核通过后自动解锁下一阶段，操作会记入审计。</div>' +
     '<label class="form-label">签核意见（可选）</label>' +
     '<textarea id="fg-comment" class="form-textarea" rows="3" placeholder="如：同意进入下一阶段"></textarea>' +
     '<div class="flex justify-end space-x-2 mt-4"><button class="btn-ghost" onclick="closeModal()">取消</button>' +
-    '<button class="btn-primary" onclick="submitGateSign(\'' + gate + '\')">签核通过</button></div>');
+    '<button class="btn-primary" id="fg-submit" onclick="submitGateSign(' + esc(jsStr(gate)) + ')">签核通过</button></div>');
 }
 async function submitGateSign(gate) {
   const comment = document.getElementById('fg-comment').value.trim();
-  try {
-    await postApi('/api/flows/' + flowState.id + '/gates/' + gate + '/sign', { comment: comment });
-    closeModal();
-    toast(gate + ' 签核通过，下一阶段已解锁');
-    route();
-  } catch (e) { toast(e.message, 'error'); }
+  await withBusy(document.getElementById('fg-submit'), async function () {
+    try {
+      await postApi('/api/flows/' + flowState.id + '/gates/' + encodeURIComponent(gate) + '/sign', { comment: comment });
+      closeModal();
+      toast(gate + ' 签核通过，下一阶段已解锁');
+      route();
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 /* 手动推进一轮（演示用），toast 汇报推进了哪些节点 */
@@ -3053,15 +3136,11 @@ window.addEventListener('DOMContentLoaded', function () {
   window.addEventListener('resize', function () {
     charts.forEach(function (c) { try { c.resize(); } catch (e) {} });
   });
-  // 一键体验：URL 带 ?person=<id> 时自动以该身份登录（便于演示与验收测试直达内页）
+  // IM 扫码登录回调：URL 带 ?im_login=<code> 时换发会话
   const urlParams = new URLSearchParams(location.search);
   const imCode = urlParams.get('im_login');
-  const urlPerson = urlParams.get('person');
   if (imCode) {
     exchangeImLoginCode(imCode);
-  } else if (urlPerson) {
-    history.replaceState(null, '', location.pathname + location.hash);
-    doLogin(Number(urlPerson));
   } else if (state.token && state.person) enterApp();
   else bootLogin();
 });

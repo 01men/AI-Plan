@@ -21,7 +21,7 @@ tailwind.config = {
         success: '#38a169',
         dark: '#0f172a',
       },
-      fontFamily: { sans: ['Noto Sans SC', 'system-ui', 'sans-serif'] }
+      fontFamily: { sans: ['system-ui', 'sans-serif'] }
     }
   }
 };
@@ -44,8 +44,10 @@ tailwind.config = {
       </div>
     </div>
     <div class="section-divider w-40 my-6"></div>
-    <p class="text-white font-bold mb-1">你是第一次来？点你的名字就能进去，不用密码不用学。</p>
-    <p class="text-gray-200 mb-6 text-sm">请选择你的身份进入平台（演示环境免密登录）：</p>
+    <div id="login-demo-copy">
+      <p class="text-white font-bold mb-1">你是第一次来？点你的名字就能进去，不用密码不用学。</p>
+      <p class="text-gray-200 mb-6 text-sm">请选择你的身份进入平台（演示环境免密登录）：</p>
+    </div>
     <div id="login-people">
       <div class="text-gray-300 flex items-center space-x-2">
         <span class="spinner"></span><span>正在加载组织人员…</span>
@@ -53,7 +55,7 @@ tailwind.config = {
     </div>
     <div class="section-divider w-40 my-6"></div>
     <p class="text-white font-bold mb-1">用惯了钉钉/飞书？扫码也能进</p>
-    <p class="text-gray-200 mb-3 text-sm">已绑定 IM 账号的同事一键进入（演示环境为模拟授权）：</p>
+    <p id="login-im-copy" class="text-gray-200 mb-3 text-sm">已绑定 IM 账号的同事一键进入（演示环境为模拟授权）：</p>
     <div class="flex gap-3">
       <button class="im-btn" onclick="imLogin('dingtalk')">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h8M8 8h8m-8 8h5M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>

@@ -3,10 +3,12 @@
 - Base URL：`http://127.0.0.1:8000`
 - 启动：`python -m uvicorn app.main:app --port 8000`（首次启动自动建库 `data/platform.db` 并播种）
 - 全部接口返回 JSON；错误格式统一为 `{"detail": "错误信息"}`（HTTP 状态码 400/401/404 等）
-- 认证：业务接口需要 `Authorization: Bearer <token>`；公开入口仅包括登录、健康检查、
-  登录人员最小清单、IM 可用状态、IM 登录授权/回调/轮询与同源二维码。
-- 会话有效期 12 小时；`POST /api/logout` 会立即撤销当前 token。
-- 写操作（POST/PATCH/审核/审批）均会写入 `audits` 审计表（`POST /api/login` 除外：登录是高频流水，不记审计）
+- 认证：业务接口需要 `Authorization: Bearer <token>`；公开入口仅包括登录、健康检查与就绪探针、
+  运行环境探测（`/api/environment`）、登录人员最小清单（仅 demo 模式）、IM 可用状态、IM 登录授权/回调/轮询与同源二维码。
+- 运行模式：`PLATFORM_MODE=demo`（默认，保留免密演示登录）/ `production`（关闭免密登录、演示 OAuth 回调与公开人员清单，仅企业 IM 授权登录；未配置真实 IM/模型时 `GET /api/health/ready` 返回 503 并列出阻断项）。
+- 会话有效期 12 小时；`POST /api/logout` 会立即撤销当前 token；人员离职后其既有会话立即失效（401）。
+- 写操作（POST/PATCH/审核/审批）均会写入 `audits` 审计表；例外：`POST /api/login` 高频流水不记，
+  工作区普通发言未触发派发/回复时不单记审计。
 - 中文乱码提示：curl 直接 `-d` 内联中文在 Windows Git Bash 下会损坏编码，请用 `--data-binary @file.json`
   并加 `Content-Type: application/json; charset=utf-8`（前端 fetch/axios 无此问题）
 
@@ -22,7 +24,7 @@
 | scenarios.status | `待立项` / `已立项` / `开发中` / `试点中` / `已验收` / `已下线` |
 | workspaces.type | `项目` / `部门` / `临时` |
 | messages.zone | `discussion`（讨论区）/ `agent`（Agent执行区）/ `private`（私聊区） |
-| messages.msg_type | `text` / `task_card` / `deliverable` / `approval` / `report` |
+| messages.msg_type | `text` / `task_card` / `deliverable` / `approval` / `report` / `runtime_event`（外部运行时事件回写） |
 | tasks.status | `待处理` / `进行中` / `待审核` / `已通过` / `已驳回` |
 | skills.scope | `公开` / `组织` / `个人` |
 | documents.level | `L1` / `L2` / `L3` / `L4` |
@@ -230,6 +232,8 @@
 私聊区（第一轮验收新增）：`zone=="private"` 时不派活，由「项目管理智能体」生成一条需求打磨回复
 （把需求复述成结构化任务草稿 + 建议 @ 哪个数字员工 + 示例话术），响应多一个 `reply` 字段
 （`sender_type=agent`、`msg_type=text`、`zone=private`）。
+私聊隔离（R7 起）：私聊消息写入时落 `private_owner_id`（归属发起人），`GET .../messages?zone=private`
+仅返回当前登录人本人的私聊，任何他人（含管理层）不可见。
 建议派活对象的选择（第二轮验收变更）：优先推荐本工作区成员中的数字员工（真实在区，至多 2 个，
 不含项目管理智能体自身）；本区无成员员工时才按需求关键词匹配全库员工类别兜底。
 ```json
@@ -255,19 +259,26 @@
 ### POST /api/tasks
 请求：
 ```json
-{"title": "整理8月展会客户名单", "workspace_id": 2, "agent_id": 22, "priority": "高", "requirement": "...", "deadline": "2026-07-25T18:00:00", "reviewer_id": 3}
+{"title": "整理8月展会客户名单", "workspace_id": 2, "agent_id": 22, "priority": "高", "requirement": "...", "deadline": "2026-07-25T18:00:00"}
 ```
-仅需 `title`；创建人取当前登录人。行为（第一轮验收修复）：
+仅需 `title`；创建人取当前登录人。行为：
 - **带 `agent_id`**：复用引擎执行逻辑，立即产出交付物并转 `待审核`（同步完成），
   若带 `workspace_id` 同时在工作区发 deliverable + approval 消息（payload 含 `version: 1`）；`agent_id` 不存在 → 404；
 - **不带 `agent_id`**：允许创建（保持 `待处理`，不会自动执行），响应附带提示字段：
   `"hint": "未指派数字员工，任务不会自动执行，建议到协作空间 @数字员工 派活"`。
 
+R7 加固（防伪造与越权）：
+- `staff` 无权直建任务（403），请经协作空间派活；
+- `status` 由服务端决定（不带 agent_id 恒为 `待处理`），客户端传入一律忽略；
+- `priority` 仅接受 `高/中/低`，非法值 422；
+- `reviewer_id` 若传入则校验人员存在且在职（否则 422）；带 `agent_id` 时由自动指派逻辑覆盖，请求值不生效（请勿依赖）。
+
 响应：任务对象（无 agent_id 时多一个 `hint` 字段）。
 
 ### POST /api/tasks/{id}/external-events
 
-外部 Agent 执行控制面回传任务事件。仅 `boss/coach` 身份可调用；同一 `source + event_id` 幂等，重复请求返回 `idempotent: true`。
+外部 Agent 执行控制面回传任务事件。仅 `boss/coach` 身份可调用；幂等按 `(task_id, source, event_id)`
+三元组去重（R7 起——同一 `source + event_id` 用于不同任务互不干扰），同一任务的重放返回 `idempotent: true`。
 
 请求：
 
@@ -771,7 +782,29 @@ boss/coach 导出 UTF-8 BOM CSV；对 Excel 公式前缀做转义，普通角色
 方案 28 部门配额合计 232。系统保留 81 个已定义场景，并以 `batch=规划储备` 建立
 151 个明确标记的“待部门提报场景”容量位；不伪造业务规则，待部门补齐名称、数据口径与验收标准。
 
-## 15. 其他
+## 15. R7 尽调加固契约
+
+### GET /api/environment
+免登录运行环境探测：`{"mode": "demo|production", "demo_login_enabled": true|false, "kpi_targets": {...}}`。
+`kpi_targets` 为驾驶舱目标值口径（方案口径静态值），前端据此渲染目标线而非硬编码。
+
+### GET /api/health/ready
+免登录就绪探针。demo 模式返回 `{"ok": true, "checks": {...}}`；production 模式若真实 IM/模型
+未配置就绪则返回 503 及 `blocking` 清单（响应不含任何密钥/凭证明文）。
+
+### R7 安全与正确性加固
+- 审核原子化：`POST /api/tasks/{id}/review` 以条件更新防并发双通过，非 `待审核` 状态的
+  重复/并发审核返回 400/409，绩效不重复累计；
+- 外部事件幂等改为按 `(task_id, source, event_id)` 写入 `runtime_events` 表去重（见第 6 节）；
+- OAuth state/登录码为一次性原子消费，并发轮询不可双花；
+- 知识库 HTML 上传清洗覆盖 `on*=` 事件属性、`javascript:` URL、`<iframe>` 等；HTML 文档
+  `GET /api/knowledge/documents/{id}/file` 以 `Content-Disposition: attachment` 下载，不同源直出；
+- 工作区发言：`content` 上限 20000 字符（超出 422），全部校验先于落库（校验失败不产生半消息），
+  `GET .../messages` 的 `limit` 封顶 500；
+- 模型凭证解密失败（如主密钥丢失）按"未配置"回落模板执行并记审计，不再穿透 500；
+- 心跳催办跳过未关联工作区的任务，单任务异常不影响日报与其余任务。
+
+## 16. 其他
 
 ### GET /
 前端入口：`app/static/index.html` 存在则返回该页面，否则返回兜底 JSON

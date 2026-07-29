@@ -13,6 +13,7 @@ from app.database import init_db
 from app.main import health_ready
 from app.routers.auth import get_current_person, login
 from app.routers.imbind import bind_provider, oauth_callback
+from app.routers.metrics import KPI_TARGETS
 from app.routers.org import login_people
 from app.seed import run_r4_seed, run_r6_seed, run_seed
 
@@ -36,7 +37,8 @@ class ProductionAuthTest(unittest.TestCase):
     def test_demo_is_default_and_keeps_local_cors(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
-                {"mode": "demo", "demo_login_enabled": True},
+                {"mode": "demo", "demo_login_enabled": True,
+                 "kpi_targets": KPI_TARGETS},
                 public_environment(),
             )
             self.assertEqual(
@@ -57,7 +59,8 @@ class ProductionAuthTest(unittest.TestCase):
                     call()
                 self.assertEqual(403, caught.exception.status_code)
             self.assertEqual(
-                {"mode": "production", "demo_login_enabled": False},
+                {"mode": "production", "demo_login_enabled": False,
+                 "kpi_targets": KPI_TARGETS},
                 public_environment(),
             )
 

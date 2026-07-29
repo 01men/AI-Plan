@@ -340,16 +340,6 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     created_at TEXT
 );
 
--- R7 API 幂等账本：防止弱网/重复点击造成重复消息、任务和模型费用
-CREATE TABLE IF NOT EXISTS request_idempotency (
-    scope TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    person_id INTEGER NOT NULL REFERENCES people(id),
-    response_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY(scope, request_id, person_id)
-);
-
 -- R7 外部运行时事件：事件 ID 必须在任务维度幂等，不能跨任务互相吞事件
 CREATE TABLE IF NOT EXISTS runtime_events (
     task_id INTEGER NOT NULL REFERENCES tasks(id),

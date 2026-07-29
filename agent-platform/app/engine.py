@@ -187,16 +187,30 @@ def _agent_actions(conn, agent_id):
     return []
 
 
+def _audit(conn, actor, action, target, detail=""):
+    """引擎侧审计（与 routers.auth.audit 同构；不立即 commit，由调用方事务统一提交）"""
+    conn.execute(
+        "INSERT INTO audits(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)",
+        (actor, action, target, detail, _now()))
+
+
 def _resolve_llm(conn, settings, agent):
     """解析本次生成应使用的模型配置 dict；无可用配置返回 None。
     优先级：旧 settings llm_* 三键（向后兼容）> agent.model_key 绑定 > settings.default_model_key。
     provider 停用或未配置 api_key 时返回 None（回落模板，保持离线原则）。
-    api_key 落库为 enc:v1 密文，此处解密后仅用于本次调用。"""
+    api_key 落库为 enc:v1 密文，此处解密后仅用于本次调用；
+    解密失败（主密钥丢失/密文损坏）按未配置凭证回落模板，记审计，不向上抛 500。"""
     from app import crypto
     base, key, model = (settings.get("llm_base_url"), settings.get("llm_api_key"),
                         settings.get("llm_model"))
     if base and key and model:
-        return {"provider": "custom", "base_url": base, "api_key": crypto.decrypt(key),
+        try:
+            api_key = crypto.decrypt(key)
+        except Exception:
+            _audit(conn, "系统", "凭证解密失败", "settings.llm_api_key",
+                   "主密钥缺失或密文损坏，按未配置凭证回落模板执行")
+            return None
+        return {"provider": "custom", "base_url": base, "api_key": api_key,
                 "model": model, "temperature": 0.4, "timeout": 30}
     mk = dict(agent).get("model_key") or settings.get("default_model_key") or "glm"
     row = conn.execute("SELECT * FROM model_providers WHERE key=?", (mk,)).fetchone()
@@ -207,8 +221,14 @@ def _resolve_llm(conn, settings, agent):
     # Kimi Coding 的 OpenAI 兼容接口当前只接受 temperature=1。
     if row["key"] == "kimi" and "api.kimi.com/coding" in (row["base_url"] or ""):
         temperature = 1.0
+    try:
+        api_key = crypto.decrypt(row["api_key"])
+    except Exception:
+        _audit(conn, "系统", "凭证解密失败", f"model_providers.{row['key']}",
+               "主密钥缺失或密文损坏，按未配置凭证回落模板执行")
+        return None
     return {"provider": row["key"], "base_url": row["base_url"],
-            "api_key": crypto.decrypt(row["api_key"]), "model": row["default_model"],
+            "api_key": api_key, "model": row["default_model"],
             "temperature": temperature,
             "timeout": row["timeout"] if "timeout" in cols and row["timeout"] else 30}
 
@@ -425,12 +445,14 @@ def _business_context(conn, content):
     return "\n".join(lines)
 
 
-def _chat_history(conn, workspace_id, agent_id, limit=14):
+def _chat_history(conn, workspace_id, agent_id, limit=14, person_id=None):
+    # 私聊区消息仅归属人本人可见，召回进模型上下文同样按 owner 过滤，
+    # 避免他人私聊草稿经对话上下文泄露（与 list_messages 的私聊隔离同口径）。
     rows = conn.execute(
         "SELECT sender_type,sender_id,sender_name,msg_type,content FROM messages "
-        "WHERE workspace_id=? AND zone IN ('agent','private') "
+        "WHERE workspace_id=? AND (zone='agent' OR (zone='private' AND private_owner_id=?)) "
         "AND msg_type IN ('text','deliverable') ORDER BY id DESC LIMIT ?",
-        (workspace_id, limit),
+        (workspace_id, person_id or -1, limit),
     ).fetchall()
     messages = []
     for row in reversed(rows):
@@ -483,7 +505,7 @@ def chat_with_agent(conn, workspace_id, agent_id, person, content):
         "\n\n【默认制造业务数据】\n" + _business_context(conn, content)
     )
     messages = [{"role": "system", "content": persona + "\n\n" + context}]
-    messages.extend(_chat_history(conn, workspace_id, agent["id"]))
+    messages.extend(_chat_history(conn, workspace_id, agent["id"], person_id=person["id"]))
     # 当前人类消息已先写入 messages 表，若历史窗口未包含则显式补入。
     if not messages or content not in messages[-1].get("content", ""):
         messages.append({"role": "user", "content": f"{person['name']}：{content}"})
@@ -558,11 +580,23 @@ def _pick_reviewer(conn, workspace_id, creator_id):
     return None
 
 
-def _add_message(conn, wid, stype, sid, sname, zone, mtype, content, payload=None):
+def _add_message(conn, wid, stype, sid, sname, zone, mtype, content, payload=None,
+                 private_owner_id=None):
     return conn.execute(
-        "INSERT INTO messages(workspace_id,sender_type,sender_id,sender_name,zone,msg_type,content,payload,created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?)",
-        (wid, stype, sid, sname, zone, mtype, content, J(payload) if payload else None, _now())).lastrowid
+        "INSERT INTO messages(workspace_id,sender_type,sender_id,sender_name,zone,msg_type,content,"
+        "payload,private_owner_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (wid, stype, sid, sname, zone, mtype, content, J(payload) if payload else None,
+         private_owner_id, _now())).lastrowid
+
+
+def _execution_fields(model_info):
+    """交付物落库三字段 execution_mode/error/ms（dispatch、rework、任务直建共用同一映射）"""
+    return (
+        "template_fallback" if model_info.get("fallback") and model_info.get("provider")
+        else ("template" if model_info.get("fallback") else "llm"),
+        model_info.get("reason") if model_info.get("provider") else None,
+        model_info.get("latency_ms", 0),
+    )
 
 
 def dispatch(conn, workspace_id, agent_id, human_name, requirement_text, creator_id=None):
@@ -579,14 +613,12 @@ def dispatch(conn, workspace_id, agent_id, human_name, requirement_text, creator
 
     deliverable, model_info = generate_deliverable(conn, agent, requirement_text, task_id)
     reviewer = _pick_reviewer(conn, workspace_id, creator_id)
+    mode, exec_error, exec_ms = _execution_fields(model_info)
     conn.execute(
         "UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=?,model_provider=?,"
         "model_name=?,execution_mode=?,execution_error=?,execution_ms=? WHERE id=?",
         (deliverable, reviewer, model_info.get("provider"), model_info.get("model"),
-         "template_fallback" if model_info.get("fallback") and model_info.get("provider")
-         else ("template" if model_info.get("fallback") else "llm"),
-         model_info.get("reason") if model_info.get("provider") else None,
-         model_info.get("latency_ms", 0), task_id),
+         mode, exec_error, exec_ms, task_id),
     )
 
     _add_message(conn, workspace_id, "agent", agent_id, agent["name"], "agent", "deliverable",
@@ -604,7 +636,9 @@ def _deliverable_version(conn, task_id, workspace_id):
         return 1
     row = conn.execute(
         "SELECT COUNT(*) c FROM messages WHERE workspace_id=? AND msg_type='deliverable' "
-        "AND payload LIKE ?", (workspace_id, f'%"task_id": {task_id}%')).fetchone()
+        "AND (payload LIKE ? OR payload LIKE ?)",
+        # JSON 中 id 后必为逗号或右花括号，避免 task#6 误配 task#60
+        (workspace_id, f'%"task_id": {task_id},%', f'%"task_id": {task_id}}}%')).fetchone()
     return row["c"] + 1
 
 
@@ -620,14 +654,12 @@ def rework(conn, task_id):
     comment = (task["review_comment"] or "").strip() or "（未填写具体意见）"
     deliverable = (f"第 {version} 版修订说明：针对上一轮驳回意见『{comment}』，"
                    f"本版已逐项修订，请复核。\n\n" + deliverable)
+    mode, exec_error, exec_ms = _execution_fields(model_info)
     conn.execute(
         "UPDATE tasks SET status='待审核',deliverable=?,model_provider=?,model_name=?,"
         "execution_mode=?,execution_error=?,execution_ms=? WHERE id=?",
         (deliverable, model_info.get("provider"), model_info.get("model"),
-         "template_fallback" if model_info.get("fallback") and model_info.get("provider")
-         else ("template" if model_info.get("fallback") else "llm"),
-         model_info.get("reason") if model_info.get("provider") else None,
-         model_info.get("latency_ms", 0), task_id),
+         mode, exec_error, exec_ms, task_id),
     )
     if task["workspace_id"]:
         _add_message(conn, task["workspace_id"], "agent", agent["id"], agent["name"], "agent",
@@ -691,7 +723,8 @@ def private_assist(conn, workspace_id, person, content):
     if not suggested:
         return _add_message(
             conn, workspace_id, "system", None, "系统", "private", "text",
-            "当前没有可用数字员工，请联系项目负责人启用或加入数字员工后再派活。")
+            "当前没有可用数字员工，请联系项目负责人启用或加入数字员工后再派活。",
+            private_owner_id=person["id"])
     brief = content.strip().replace("\n", " ")
     if len(brief) > 60:
         brief = brief[:60] + "…"
@@ -720,7 +753,7 @@ def private_assist(conn, workspace_id, person, content):
 
 > 以上由项目管理智能体自动整理，确认后可复制示例话术到协作空间直接派活。"""
     return _add_message(conn, workspace_id, "agent", pm["id"], pm["name"],
-                        "private", "text", reply)
+                        "private", "text", reply, private_owner_id=person["id"])
 
 
 # ---------------- 派活兜底：无可用数字员工时的引导（R5，徐露璐场景） ----------------
@@ -846,8 +879,16 @@ def heartbeat(conn):
                   "flow_warnings": len(warn_lines)})
 
     for t in due:
-        _add_message(conn, t["workspace_id"], "system", None, "系统", "agent", "text",
-                     f"催办：任务 #{t['id']}「{t['title']}」距截止时间不足 24 小时，请尽快处理/审核。")
+        if not t["workspace_id"]:
+            # 无工作区的任务（如待派活登记）无区可发：跳过工作区消息只记审计，不拖垮整个心跳
+            _audit(conn, "系统", "催办跳过", f"任务#{t['id']}", "任务无工作区，跳过工作区催办消息")
+            continue
+        try:
+            _add_message(conn, t["workspace_id"], "system", None, "系统", "agent", "text",
+                         f"催办：任务 #{t['id']}「{t['title']}」距截止时间不足 24 小时，请尽快处理/审核。")
+        except Exception:
+            # 单个任务催办异常不影响其余任务与日报提交
+            _audit(conn, "系统", "催办失败", f"任务#{t['id']}", "催办消息写入异常，已跳过")
     conn.commit()
     return {"ok": True, "date": today.isoformat(), "done_yesterday": done_yesterday,
             "pilot_scenarios": pilot_cnt, "coverage": coverage,

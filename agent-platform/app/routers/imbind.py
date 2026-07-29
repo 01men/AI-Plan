@@ -303,10 +303,10 @@ def poll_oauth_login(request_id: str, conn=Depends(db_conn)):
     if not request_id or len(request_id) > 128:
         raise HTTPException(422, "授权请求编号格式错误")
     key = f"oauth-result:{request_id}"
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    # 一次性结果原子取出：单语句 DELETE ... RETURNING，并发轮询只有一方拿得到
+    row = conn.execute("DELETE FROM settings WHERE key=? RETURNING value", (key,)).fetchone()
     if not row:
         return {"ok": True, "pending": True}
-    conn.execute("DELETE FROM settings WHERE key=?", (key,))
     conn.commit()
     login_row = consume_login_code(conn, row["value"])
     if not login_row:
