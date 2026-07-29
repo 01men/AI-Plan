@@ -2,12 +2,14 @@
 __pycache__/
 *.pyc
 
-# 运行时数据（数据库/日志，首次启动自动重建）
+# 运行时数据（数据库/日志/上传产物，首次启动自动重建）
 agent-platform/data/*.db
 agent-platform/data/*.db-journal
 agent-platform/data/*.db-wal
 agent-platform/data/*.db-shm
 agent-platform/data/*.log
+agent-platform/data/uploads/
+agent-platform/data/knowledge/
 multica-platform/data/*.db
 multica-platform/data/*.db-journal
 multica-platform/data/*.db-wal
