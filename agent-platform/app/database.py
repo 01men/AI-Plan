@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS messages (
     msg_type TEXT DEFAULT 'text',   -- text/task_card/deliverable/approval/report
     content TEXT,
     payload TEXT,                   -- JSON 可空
+    private_owner_id INTEGER REFERENCES people(id), -- 私聊仅该人员本人可见
     created_at TEXT
 );
 
@@ -331,7 +332,32 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     latency_ms INTEGER DEFAULT 0,
     error TEXT,                        -- 失败原因（脱敏，不含密钥）
     fallback_reason TEXT,              -- 回落模板原因
+    user_id INTEGER REFERENCES people(id),
+    workspace_id INTEGER REFERENCES workspaces(id),
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
     created_at TEXT
+);
+
+-- R7 API 幂等账本：防止弱网/重复点击造成重复消息、任务和模型费用
+CREATE TABLE IF NOT EXISTS request_idempotency (
+    scope TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    person_id INTEGER NOT NULL REFERENCES people(id),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(scope, request_id, person_id)
+);
+
+-- R7 外部运行时事件：事件 ID 必须在任务维度幂等，不能跨任务互相吞事件
+CREATE TABLE IF NOT EXISTS runtime_events (
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    source TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(task_id, source, event_id)
 );
 
 -- R6 默认制造业务展示数据：每次启动幂等补齐 DEMO-0001..DEMO-1000
@@ -355,6 +381,12 @@ CREATE TABLE IF NOT EXISTS business_records (
 
 CREATE INDEX IF NOT EXISTS ix_business_records_type_date
 ON business_records(business_type, business_date);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_workspace_member
+ON workspace_members(workspace_id, member_type, member_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_metrics_daily_agent_date
+ON metrics_daily(date, agent_id);
 """
 
 # 老库增量迁移：逐条尝试，已存在则忽略（sqlite 不支持 IF NOT EXISTS 加列）
@@ -376,6 +408,12 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN execution_error TEXT",
     "ALTER TABLE tasks ADD COLUMN execution_ms INTEGER DEFAULT 0",
     "ALTER TABLE incentives ADD COLUMN review_comment TEXT",
+    "ALTER TABLE messages ADD COLUMN private_owner_id INTEGER REFERENCES people(id)",
+    "ALTER TABLE llm_calls ADD COLUMN user_id INTEGER REFERENCES people(id)",
+    "ALTER TABLE llm_calls ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id)",
+    "ALTER TABLE llm_calls ADD COLUMN prompt_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE llm_calls ADD COLUMN completion_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE llm_calls ADD COLUMN total_tokens INTEGER DEFAULT 0",
 ]
 
 
@@ -385,6 +423,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     for sql in MIGRATIONS:
         try:
             conn.execute(sql)
-        except sqlite3.OperationalError:
-            pass  # 列已存在
+        except sqlite3.OperationalError as exc:
+            # 只忽略 SQLite 明确报告的重复列；磁盘、锁、SQL 拼写等真实迁移错误必须阻断启动。
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.commit()

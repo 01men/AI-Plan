@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import crypto, engine
+from app.config import allowed_origins, platform_mode
 from app.database import get_db, init_db
 from app.routers import (agents, auth, flows, governance, imbind, knowledge, mcp,
                          metrics, models, org, roadmap, scenarios, skills, tasks,
@@ -29,10 +30,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     detail = f"参数校验失败：{('、'.join(sorted(set(fields))))} 缺失或格式错误"
     return JSONResponse(status_code=422, content={"detail": detail})
 
-# 仅允许本机交付地址跨源访问，避免任意网页携带本地 Token 调用平台。
+# CORS 来源由运行环境显式配置；demo 默认仅允许本机，production 默认不开放跨源。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=allowed_origins(),
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -72,6 +73,64 @@ def index():
 def health():
     """部署/验收探针，不读取业务数据。"""
     return {"ok": True, "service": "rongqi-agent-platform", "version": app.version}
+
+
+@app.get("/api/health/ready")
+def health_ready(conn=Depends(db_conn)):
+    """生产就绪深探针：检查数据库、展示数据和模型/IM 配置，不返回凭证或地址。"""
+    mode = platform_mode()
+    checks = {
+        "database": {"ok": False},
+        "business_data": {"ok": False, "count": 0, "required": True},
+        "model_provider": {"ok": False, "configured_count": 0,
+                           "required": mode == "production"},
+        "im_provider": {"ok": False, "configured_count": 0,
+                        "required": mode == "production"},
+    }
+    try:
+        conn.execute("SELECT 1").fetchone()
+        checks["database"]["ok"] = True
+        business_count = conn.execute(
+            "SELECT COUNT(*) c FROM business_records"
+        ).fetchone()["c"]
+        checks["business_data"].update(
+            {"ok": business_count >= 1000, "count": business_count}
+        )
+        model_count = conn.execute(
+            "SELECT COUNT(*) c FROM model_providers "
+            "WHERE enabled=1 AND TRIM(COALESCE(api_key,''))<>'' "
+            "AND TRIM(COALESCE(base_url,''))<>'' "
+            "AND TRIM(COALESCE(default_model,''))<>''"
+        ).fetchone()["c"]
+        checks["model_provider"].update(
+            {"ok": model_count > 0, "configured_count": model_count}
+        )
+        im_count = conn.execute(
+            "SELECT COUNT(*) c FROM auth_providers "
+            "WHERE enabled=1 AND TRIM(COALESCE(app_id,''))<>'' "
+            "AND TRIM(COALESCE(app_secret,''))<>''"
+        ).fetchone()["c"]
+        checks["im_provider"].update(
+            {"ok": im_count > 0, "configured_count": im_count}
+        )
+    except Exception:
+        # 深探针只报告组件不可用，不回显 SQL、路径、异常或凭证。
+        checks["database"]["ok"] = False
+
+    blocking = [
+        name for name, result in checks.items()
+        if (name == "database" or result.get("required")) and not result["ok"]
+    ]
+    ready = not blocking
+    payload = {
+        "ok": ready,
+        "service": "rongqi-agent-platform",
+        "version": app.version,
+        "mode": mode,
+        "checks": checks,
+        "blocking": blocking,
+    }
+    return payload if ready else JSONResponse(status_code=503, content=payload)
 
 
 @app.post("/api/heartbeat/run")

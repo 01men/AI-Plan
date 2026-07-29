@@ -1,6 +1,7 @@
 """组织架构：平台-部门-人-数字员工 树"""
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.config import demo_login_enabled
 from app.routers.auth import db_conn, get_current_person, person_view
 
 router = APIRouter(prefix="/api", tags=["org"])
@@ -45,6 +46,8 @@ def list_people(tier: str = None, dept_id: int = None, conn=Depends(db_conn),
 @router.get("/login/people")
 def login_people(conn=Depends(db_conn)):
     """演示登录选择器：只公开在职人员的必要展示字段。"""
+    if not demo_login_enabled():
+        raise HTTPException(403, "生产模式不公开人员列表，请使用企业 IM 授权登录")
     return [person_view(conn, r) for r in conn.execute(
         "SELECT id,dept_id,name,role_title,tier,direction,status FROM people "
         "WHERE status='在职' ORDER BY id")]

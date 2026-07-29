@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+from app.config import demo_login_enabled, public_environment
 from app.database import get_db
 
 router = APIRouter(prefix="/api", tags=["auth"])
@@ -51,9 +52,11 @@ def get_current_person(authorization: str = Header(None), conn=Depends(db_conn))
             person_id = int(payload)
     except (json.JSONDecodeError, TypeError):
         person_id = int(row["value"])  # 兼容旧会话
-    person = conn.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
+    person = conn.execute(
+        "SELECT * FROM people WHERE id=? AND status='在职'", (person_id,)
+    ).fetchone()
     if not person:
-        raise HTTPException(401, "账号不存在")
+        raise HTTPException(401, "账号不存在或已停用")
     return person_view(conn, person)
 
 
@@ -88,8 +91,16 @@ def issue_session(conn, person_id: int, hours: int = 12):
 
 @router.post("/login")
 def login(body: LoginIn, conn=Depends(db_conn)):
+    if not demo_login_enabled():
+        raise HTTPException(403, "生产模式已关闭演示身份登录，请使用企业 IM 授权登录")
     # 登录是高频流水，不写 audits，避免刷屏淹没真实操作审计
     return issue_session(conn, body.person_id)
+
+
+@router.get("/environment")
+def environment():
+    """公开返回安全的运行模式与演示登录能力，供登录页选择认证方式。"""
+    return public_environment()
 
 
 @router.get("/me")

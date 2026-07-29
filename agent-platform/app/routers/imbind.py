@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from app import crypto
+from app.config import is_demo_mode
 from app.routers.auth import audit, db_conn, get_current_person, issue_session
 from app.security import (consume_login_code, consume_oauth_state, create_login_code,
                           create_oauth_state, public_error)
@@ -145,6 +146,8 @@ def oauth_url(provider: str, conn=Depends(db_conn), person=Depends(get_current_p
                 "app_id": conf["app_id"], "redirect_uri": redirect,
                 "state": state})
         return {"provider": provider, "demo": False, "url": f"{meta['authorize']}?{qs}"}
+    if not is_demo_mode():
+        raise HTTPException(409, f"{meta['label']}应用凭证未配置，生产模式禁止模拟授权")
     return {"provider": provider, "demo": True,
             "url": f"/api/auth/oauth/{provider}/callback?demo=1&state={state}",
             "tip": f"未配置{meta['label']}应用凭证，当前为演示模式（配置后自动切换真实授权）"}
@@ -240,6 +243,8 @@ def oauth_callback(provider: str, code: str = None, demo: str = None,
                    person_id: int = None, state: str = None, conn=Depends(db_conn)):
     """一次性 state 回调：绑定或登录；真实登录返回短期交换码而非在 URL 暴露 Token。"""
     meta = _check_provider(provider)
+    if demo and not is_demo_mode():
+        raise HTTPException(403, "生产模式禁止演示 OAuth 回调")
     state_payload = consume_oauth_state(conn, state or "", provider)
     # 仅演示环境保留旧 person_id 兼容；真实授权一律要求不可预测、一次性的 state。
     pid = state_payload.get("person_id") if state_payload else (person_id if demo else None)
@@ -329,6 +334,8 @@ def list_bindings(conn=Depends(db_conn), person=Depends(get_current_person)):
 @router.post("/bindings/{provider}")
 def bind_provider(provider: str, conn=Depends(db_conn), person=Depends(get_current_person)):
     """主动绑定入口（demo 用）：等效于 demo 回调，直接模拟外部身份完成绑定"""
+    if not is_demo_mode():
+        raise HTTPException(403, "生产模式禁止主动模拟绑定，请使用真实企业 IM 授权")
     meta = _check_provider(provider)
     binding = _bind(conn, person["id"], provider,
                     f"demo_{provider}_{person['id']}",
