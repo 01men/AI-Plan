@@ -1,7 +1,7 @@
 {
   "summary": {
-    "total": 33,
-    "passed": 33,
+    "total": 32,
+    "passed": 32,
     "failed": 0,
     "failures": []
   },
@@ -28,7 +28,7 @@
       "role": "董事长",
       "item": "项目流程列表可读",
       "ok": true,
-      "evidence": "7 个流程"
+      "evidence": "2 个流程"
     },
     {
       "role": "董事长",
@@ -40,13 +40,13 @@
       "role": "师圆圆",
       "item": "敏捷申报场景",
       "ok": true,
-      "evidence": "84"
+      "evidence": "233"
     },
     {
       "role": "师圆圆",
       "item": "一键立项自动建工作区",
       "ok": true,
-      "evidence": "ws#13"
+      "evidence": "ws#7"
     },
     {
       "role": "师圆圆",
@@ -58,7 +58,7 @@
       "role": "师圆圆",
       "item": "激励申报(800元合规)",
       "ok": true,
-      "evidence": "6"
+      "evidence": "4"
     },
     {
       "role": "戴栓",
@@ -70,7 +70,7 @@
       "role": "戴栓",
       "item": "覆盖率双口径",
       "ok": true,
-      "evidence": "coverage=0.0/trial=6.0"
+      "evidence": "coverage=0.0/trial=2.2"
     },
     {
       "role": "胡鑫",
@@ -88,7 +88,7 @@
       "role": "胡鑫",
       "item": "agent区@派活或明确兜底",
       "ok": true,
-      "evidence": "本工作区的数字员工（外贸跟单数字员工）已下线，暂时无法承接新任务，可联系负责人（谢荣浩）或改派其他在线员工。"
+      "evidence": "[{'task_id': 6, 'agent_id': 22, 'agent_name': '外贸跟单数字员工'}]"
     },
     {
       "role": "胡鑫",
@@ -110,15 +110,9 @@
     },
     {
       "role": "徐露璐",
-      "item": "agent区发言有明确结果(兜底登记)",
+      "item": "agent区发言有明确结果(已派发)",
       "ok": true,
-      "evidence": "本工作区的数字员工（外贸跟单数字员工）已下线，暂时无法承接新任务，可联系负责人（谢荣浩）或改派其他在线员工。"
-    },
-    {
-      "role": "徐露璐",
-      "item": "待处理需求可在任务中心查到",
-      "ok": true,
-      "evidence": "[待派活] 请帮我整理本周售后维修记录"
+      "evidence": "[{'task_id': 7, 'agent_id': 22, 'agent_name': '外贸跟单数字员工'}]"
     },
     {
       "role": "徐露璐",
@@ -160,7 +154,7 @@
       "role": "杨思严",
       "item": "审计留痕可按动作筛选",
       "ok": true,
-      "evidence": "3 条"
+      "evidence": "1 条"
     },
     {
       "role": "李丹",
