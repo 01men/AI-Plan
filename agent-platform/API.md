@@ -537,7 +537,143 @@ signed_at/comment）、`critical_chain`（主链路 12 节点序列）、`stage_
 
 ---
 
-## 13. 其他
+## 13. R4 新增能力
+
+### 13.1 模型供应商配置（R4-1）
+
+引擎生成交付物时的模型解析优先级：旧 `settings.llm_*` 三键（向后兼容）> `agents.model_key`
+绑定的供应商 > `settings.default_model_key`（默认 glm）。供应商停用或未配置 api_key 时静默回落模板。
+
+#### GET /api/models
+供应商列表（api_key 脱敏）：
+```json
+[{"id": 1, "key": "glm", "name": "智谱GLM", "base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "default_model": "glm-4-flash", "api_key": "未配置", "enabled": true, "is_default": true}]
+```
+
+#### PUT /api/models/default
+设置全局默认模型（boss/coach）。请求：`{"key": "kimi"}`。
+响应：`{"ok": true, "default_model_key": "kimi", "providers": [...]}`。404 供应商不存在。
+
+#### PUT /api/models/{key}
+配置单个供应商（boss/coach），可改 `api_key / default_model / enabled`。
+请求：`{"api_key": "你的Key", "enabled": true}`。响应：更新后对象（api_key 脱敏为 已配置/未配置）。
+
+#### agents 补充
+`POST /api/agents` 与 `PATCH /api/agents/{id}` 均支持 `model_key`（空=跟随全局默认）；
+`GET /api/agents/{id}` 返回中新增 `model_key / mcp_ids / mcp`（见 13.2）。
+
+### 13.2 Skill 维护 / Agent 新建 / MCP（R4-2）
+
+#### PATCH /api/skills/{id}
+改 `name/scope/category/owner_name/description`（boss/coach）。404 Skill 不存在。
+
+#### DELETE /api/skills/{id}
+删除（boss/coach）。响应：`{"ok": true, "deleted": 21}`。
+
+#### POST /api/agents
+新建数字员工（boss/coach/developer）。`name/dept_id` 必填，`code` 自动生成
+（优先沿用部门前缀 `DE-{部门码}-{序号}`，兜底 `DE-C{id}`）：
+```json
+{"name": "单证审核数字员工", "dept_id": 11, "category": "业务/项目助理",
+ "description": "...", "skills": ["信用证审单"], "model_key": "glm", "mcp_ids": [1, 3]}
+```
+响应：创建的 agent 对象（含展开后的 `mcp` 数组）。404 部门/MCP/模型不存在。
+
+#### PATCH /api/agents/{id}（扩展）
+新增可更新字段：`dept_id / model_key / mcp_ids`（mcp_ids 传 id 数组，落库 JSON）。
+`GET /api/agents/{id}` 返回新增：`model_key`、`mcp_ids`（数组）、`mcp`（MCP 对象数组）。
+
+#### GET /api/mcp
+MCP 服务台账：`[{id, name, endpoint, description, status}, ...]`（status：启用/停用）。
+
+#### POST /api/mcp
+新增（boss/coach）：`{"name": "ERP只读接口", "endpoint": "mcp://erp.internal/read", "description": "...", "status": "停用"}`。
+
+#### PATCH /api/mcp/{id}
+改 `name/endpoint/description/status`（boss/coach；status 枚举校验）。
+
+### 13.3 知识库上传与自动解析（R4-3）
+
+#### POST /api/knowledge/spaces/{sid}/upload
+multipart 文件上传（backbone/coach/boss/developer）。表单字段：`file`（必填）、`level`（默认 L1）、`tags`。
+转换规则：
+
+| 扩展名 | 转换产物 | converted_format |
+| ------ | -------- | ---------------- |
+| .txt/.md | 直存 .md | md |
+| .docx | zipfile 解 word/document.xml 提取文本存 .md | md |
+| .pdf | 系统 pdftotext 提取存 .md（失败给中文 422） | md |
+| .csv/.json | 解析入 SQLite（`data/knowledge/doc_{id}.db` 的 data_rows 表）+ 生成 .md 摘要（列名+前 5 行） | sqlite |
+| .html/.htm | 去 script/style 后存 .html | html |
+| 其他 | 422 中文错误 | - |
+
+产物存 `data/uploads/space_{sid}/`；同时写入 `doc_chunks`（md 类按标题/空行约 500 字/块，
+html 类按纯文本段落，表格类每 50 行一块），`documents.summary`=首个 chunk 前 200 字。
+响应：文档对象（含 `file_path / converted_format / chunk_count / summary`）。
+
+#### GET /api/knowledge/documents/{id}
+文档详情 + `chunks[]`（`{id,seq,heading,content}`，按 seq 升序）+ `summary`。
+
+#### GET /api/knowledge/documents/{id}/file
+下载/预览转换产物（md→text/markdown，html→text/html）。404 无解析产物。
+
+### 13.4 钉钉/飞书绑定授权（R4-4）
+
+#### GET /api/auth/providers
+授权配置列表（app_secret 脱敏为 已配置/未配置，附 `configured` 是否可用真实授权）。
+
+#### PUT /api/auth/providers/{provider}
+配置 `app_id/app_secret/redirect_uri/enabled`（仅 boss/coach；secret 返回脱敏、不落审计明文）。
+
+#### GET /api/auth/oauth/{provider}/url
+生成授权 URL。已配置凭证→平台标准授权地址（钉钉 `login.dingtalk.com/oauth2/auth`，
+飞书 `open.feishu.cn/open-apis/authen/v1/authorize`，state=当前人 id）；
+未配置→demo 模式：
+```json
+{"provider": "dingtalk", "demo": true,
+ "url": "/api/auth/oauth/dingtalk/callback?demo=1&person_id=20",
+ "tip": "未配置钉钉应用凭证，当前为演示模式（配置后自动切换真实授权）"}
+```
+
+#### GET /api/auth/oauth/{provider}/callback?code=&demo=&person_id=
+授权回调（浏览器直达，免 token）。demo 模式直接模拟外部身份（`钉钉用户_姓名`）完成绑定；
+真实模式用 code 走 urllib 换 token 换用户信息，任何异常返回中文错误 JSON
+`{"ok": false, "detail": "钉钉授权回调失败：..."}`。成功：
+`{"ok": true, "demo": true, "msg": "...", "binding": {id, person_id, provider, external_id, external_name, bound_at}}`。
+重复绑定按 `UNIQUE(person_id,provider)` 覆盖。
+
+#### GET /api/auth/bindings
+当前人的绑定列表。
+
+#### POST /api/auth/bindings/{provider}
+主动绑定入口（demo 用，直接模拟绑定）。
+
+#### DELETE /api/auth/bindings/{provider}
+解绑。404 未绑定。
+
+### 13.5 执行链路（R4-6）
+
+#### GET /api/workspaces/{id}/chain
+聚合"过去→现在→未来"执行链（前端链路条用）：
+```json
+{
+  "past": [{"type": "task_event", "task_id": 6, "time": "2026-07-19T17:12:04",
+            "title": "审核通过：你会干吗", "status": "已通过", "agent_name": "外贸跟单数字员工", "version": 2}],
+  "present": [{"id": 6, "title": "...", "status": "待审核", "agent_name": "...", "priority": "中",
+               "deadline": "...", "version": 1}],
+  "future": [{"code": "N18", "title": "平台支撑·带教答疑·代码审查", "role_name": "数字化平台",
+              "exec_type": "hybrid", "stage": 3, "status": "进行中"}],
+  "flow_id": 1
+}
+```
+- `past`：该工作区任务按时间升序的事件流（已创建/已交付/已通过/已驳回）；
+- `present`：当前进行中/待审核任务（无则为 `[]`）；
+- `future`：关联 project_flow 的未完成节点按阶段顺序取接下来 6 个（无 flow 则 `[]` 且 `flow_id` 为 null）。
+
+---
+
+## 14. 其他
 
 ### GET /
 前端入口：`app/static/index.html` 存在则返回该页面，否则返回兜底 JSON
@@ -556,3 +692,6 @@ signed_at/comment）、`critical_chain`（主链路 12 节点序列）、`stage_
 7. `GET /api/metrics/dashboard` 看 KPI 变化；`POST /api/heartbeat/run` 触发日报。
 8. 项目流程：`GET /api/flows` 看两个演示流程 → `GET /api/flows/1` 看 40 节点泳道 →
    `POST /api/flows/2/gates/G1/sign`（boss 登录）演示阶段门签核解锁阶段二。
+9. R4 联调：`GET /api/models` 配模型 Key（`PUT /api/models/glm`）→ `POST /api/agents` 新建数字员工绑技能/MCP →
+   `POST /api/knowledge/spaces/1/upload` 上传文档自动解析 → `GET /api/auth/oauth/dingtalk/url` 演示模式绑定 →
+   `GET /api/workspaces/2/chain` 看"过去→现在→未来"执行链。

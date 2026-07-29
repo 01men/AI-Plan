@@ -673,3 +673,55 @@ def run_flow_seed(conn) -> bool:
                   f"预建 {built} 个演示流程（外贸→阶段三 / 会议纪要→G1待签核）", _now()))
     conn.commit()
     return built > 0
+
+
+# ---------------- R4 增量种子（模型供应商 / MCP / IM 授权配置，settings.r4_seeded 标记） ----------------
+
+# 内置 5 家国内主流模型（均为 OpenAI 兼容接口）：key/name/base_url/default_model
+MODEL_PROVIDERS = [
+    ("glm", "智谱GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+    ("kimi", "Kimi", "https://api.moonshot.cn/v1", "moonshot-v1-8k"),
+    ("minimax", "MiniMax", "https://api.minimaxi.com/v1", "MiniMax-Text-01"),
+    ("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
+    ("qwen", "通义千问", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-turbo"),
+]
+
+MCP_SERVERS = [
+    ("ERP只读接口", "mcp://erp.internal/read", "ERP 系统只读查询接口（订单/库存/BOM），写回必须人工确认", "停用"),
+    ("钉钉消息", "mcp://im.dingtalk/messages", "钉钉群消息读取与定向通知推送", "停用"),
+    ("NAS文件检索", "mcp://nas.local/search", "群晖 NAS 知识库全文检索与文件定位", "停用"),
+]
+
+AUTH_PROVIDERS = [
+    ("dingtalk", "钉钉"),
+    ("feishu", "飞书"),
+]
+
+
+def run_r4_seed(conn) -> bool:
+    """R4 增量种子：模型供应商 / MCP 服务 / IM 授权配置 + 全局默认模型。
+    用 settings.r4_seeded 标记只跑一次；UNIQUE 键用 INSERT OR IGNORE 兜底幂等。
+    返回是否执行了播种。"""
+    if conn.execute("SELECT value FROM settings WHERE key='r4_seeded'").fetchone():
+        return False
+    for key, name, base_url, model in MODEL_PROVIDERS:
+        conn.execute(
+            "INSERT OR IGNORE INTO model_providers(key,name,base_url,default_model,api_key,enabled)"
+            " VALUES(?,?,?,?,'',1)", (key, name, base_url, model))
+    if not conn.execute("SELECT id FROM mcp_servers LIMIT 1").fetchone():
+        for name, endpoint, desc, st in MCP_SERVERS:
+            conn.execute(
+                "INSERT INTO mcp_servers(name,endpoint,description,status) VALUES(?,?,?,?)",
+                (name, endpoint, desc, st))
+    for provider, _label in AUTH_PROVIDERS:
+        conn.execute(
+            "INSERT OR IGNORE INTO auth_providers(provider,app_id,app_secret,redirect_uri,enabled)"
+            " VALUES(?,'','','',0)", (provider,))
+    conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('default_model_key','glm')")
+
+    conn.execute("INSERT INTO settings(key,value) VALUES('r4_seeded','1')")
+    conn.execute("INSERT INTO audits(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)",
+                 ("系统", "R4 增量播种", "model_providers/mcp_servers/auth_providers",
+                  "内置 5 家模型供应商、3 个 MCP 示例、钉钉/飞书授权配置（默认空凭证）", _now()))
+    conn.commit()
+    return True

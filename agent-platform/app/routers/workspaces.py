@@ -171,3 +171,52 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
               f"派发 {len(dispatched)} 个任务：" + ",".join(str(t["task_id"]) for t in dispatched))
     return {"message": _msg_view(conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()),
             "dispatched": dispatched}
+
+
+@router.get("/{wid}/chain")
+def workspace_chain(wid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
+    """R4-6 执行链路（前端可视化）：过去（任务事件）→ 现在（进行中/待审核）→ 未来（流程后续 6 节点）"""
+    if not conn.execute("SELECT id FROM workspaces WHERE id=?", (wid,)).fetchone():
+        raise HTTPException(404, "工作区不存在")
+    past, present = [], []
+    tasks = conn.execute(
+        "SELECT t.*, a.name agent_name FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id "
+        "WHERE t.workspace_id=? ORDER BY t.created_at, t.id", (wid,)).fetchall()
+    for t in tasks:
+        dmsgs = conn.execute(
+            "SELECT created_at FROM messages WHERE workspace_id=? AND msg_type='deliverable' "
+            "AND payload LIKE ? ORDER BY id", (wid, f'%"task_id": {t["id"]}%')).fetchall()
+        version = len(dmsgs) or (1 if t["deliverable"] else 0)
+        base = {"type": "task_event", "task_id": t["id"],
+                "agent_name": t["agent_name"] or "未指派", "version": version}
+        past.append({**base, "time": t["created_at"], "title": f"任务创建：{t['title']}",
+                     "status": "已创建"})
+        if t["deliverable"]:
+            past.append({**base, "time": dmsgs[0]["created_at"] if dmsgs else t["created_at"],
+                         "title": f"交付物生成：{t['title']}", "status": "已交付"})
+        if t["status"] == "已通过":
+            past.append({**base, "time": t["done_at"] or t["created_at"],
+                         "title": f"审核通过：{t['title']}", "status": "已通过"})
+        elif t["status"] == "已驳回":
+            past.append({**base,
+                         "time": t["done_at"] or (dmsgs[-1]["created_at"] if dmsgs else t["created_at"]),
+                         "title": f"审核驳回：{t['title']}", "status": "已驳回"})
+        if t["status"] in ("进行中", "待审核"):
+            present.append({"id": t["id"], "title": t["title"], "status": t["status"],
+                            "agent_name": t["agent_name"] or "未指派",
+                            "priority": t["priority"], "deadline": t["deadline"],
+                            "version": version})
+    past.sort(key=lambda e: e["time"] or "")
+
+    flow = conn.execute(
+        "SELECT * FROM project_flows WHERE workspace_id=? ORDER BY id DESC LIMIT 1",
+        (wid,)).fetchone()
+    future, flow_id = [], None
+    if flow:
+        flow_id = flow["id"]
+        future = [{"code": n["code"], "title": n["title"], "role_name": n["role_name"],
+                   "exec_type": n["exec_type"], "stage": n["stage"], "status": n["status"]}
+                  for n in conn.execute(
+                      "SELECT * FROM flow_nodes WHERE flow_id=? AND status<>'已完成' "
+                      "ORDER BY stage, id LIMIT 6", (flow_id,))]
+    return {"past": past, "present": present, "future": future, "flow_id": flow_id}

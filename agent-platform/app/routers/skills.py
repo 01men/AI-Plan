@@ -29,3 +29,44 @@ def create_skill(body: dict = Body(...), conn=Depends(db_conn), person=Depends(g
     conn.commit()
     audit(conn, person["name"], "新增Skill", name)
     return dict(conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone())
+
+
+def _check_maintainer(person):
+    if person["tier"] not in ("boss", "coach"):
+        raise HTTPException(403, "仅高管/教练团可维护 Skill")
+
+
+@router.patch("/{sid}")
+def update_skill(sid: int, body: dict = Body(...), conn=Depends(db_conn),
+                 person=Depends(get_current_person)):
+    """维护 Skill：name/scope/category/owner_name/description，权限 coach/boss"""
+    _check_maintainer(person)
+    row = conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Skill 不存在")
+    allowed = ("name", "scope", "category", "owner_name", "description")
+    sets, args = [], []
+    for k in allowed:
+        if k in body:
+            sets.append(f"{k}=?")
+            args.append(body[k])
+    if not sets:
+        raise HTTPException(400, "没有可更新的字段")
+    args.append(sid)
+    conn.execute(f"UPDATE skills SET {', '.join(sets)} WHERE id=?", args)
+    conn.commit()
+    audit(conn, person["name"], "更新Skill", row["name"], f"更新字段：{','.join(body.keys())}")
+    return dict(conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone())
+
+
+@router.delete("/{sid}")
+def delete_skill(sid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
+    """删除 Skill，权限 coach/boss"""
+    _check_maintainer(person)
+    row = conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Skill 不存在")
+    conn.execute("DELETE FROM skills WHERE id=?", (sid,))
+    conn.commit()
+    audit(conn, person["name"], "删除Skill", row["name"])
+    return {"ok": True, "deleted": sid}

@@ -74,6 +74,20 @@ function fmtWan(v) {
 function canReview() {
   return state.person && ['boss', 'coach', 'backbone'].indexOf(state.person.tier) >= 0;
 }
+/* R4 权限层级：boss/coach = 管理配置（模型/Skill/MCP/IM 凭证）；developer 及以上 = 新建数字员工/上传文档 */
+function canAdmin() {
+  return state.person && ['boss', 'coach'].indexOf(state.person.tier) >= 0;
+}
+function canCreateAgent() {
+  return state.person && ['boss', 'coach', 'backbone', 'developer'].indexOf(state.person.tier) >= 0;
+}
+function canUploadDoc() {
+  return state.person && ['boss', 'coach', 'backbone', 'developer'].indexOf(state.person.tier) >= 0;
+}
+/* 是否可修改某个数字员工档案（与后端一致：boss/coach 或其负责人本人） */
+function canEditAgent(a) {
+  return state.person && (canAdmin() || (a && a.owner_id === state.person.id));
+}
 function tierBadge(tier) {
   const m = TIER_META[tier] || { label: tier || '未知', badge: 'bg-gray-400' };
   return '<span class="badge ' + m.badge + '">' + esc(m.label) + '</span>';
@@ -161,6 +175,31 @@ async function api(path, options) {
 function postApi(path, body) {
   return api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 }
+function putApi(path, body) {
+  return api(path, { method: 'PUT', body: JSON.stringify(body || {}) });
+}
+function patchApi(path, body) {
+  return api(path, { method: 'PATCH', body: JSON.stringify(body || {}) });
+}
+function delApi(path) {
+  return api(path, { method: 'DELETE' });
+}
+/* multipart 上传专用：不能带 JSON Content-Type，交给浏览器生成 boundary */
+async function uploadApi(path, formData) {
+  const headers = {};
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  let res;
+  try {
+    res = await fetch(path, { method: 'POST', headers: headers, body: formData });
+  } catch (e) {
+    throw new Error('网络异常，请确认后端服务已启动');
+  }
+  if (res.status === 401) { doLogout(); throw new Error('登录已过期，请重新选择身份登录'); }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* 空响应 */ }
+  if (!res.ok) throw new Error((data && data.detail) || ('请求失败（HTTP ' + res.status + '）'));
+  return data;
+}
 
 /* ==================== 导航与路由 ==================== */
 const ICON = {
@@ -222,6 +261,9 @@ function renderSidebarUser() {
         '<div class="text-white text-sm font-bold truncate">' + esc(p.name) + '</div>' +
         '<div class="text-gray-400 text-xs truncate">' + esc(p.role_title || '') + ' · ' + esc(p.dept_name || '') + '</div>' +
       '</div>' +
+      '<button onclick="openImBindModal()" title="IM 绑定（钉钉/飞书）" class="text-gray-400 hover:text-white shrink-0">' +
+        '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244"/></svg>' +
+      '</button>' +
       '<button onclick="doLogout()" title="退出登录" class="text-gray-400 hover:text-white shrink-0">' +
         '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>' +
       '</button>' +
@@ -287,6 +329,7 @@ async function bootLogin() {
   box.innerHTML = '<div class="text-gray-300 flex items-center space-x-2"><span class="spinner"></span><span>正在加载组织人员…</span></div>';
   try {
     const people = await api('/api/people');
+    loginPeopleCache = people;
     let html = '';
     TIER_ORDER.forEach(function (tier) {
       const group = people.filter(function (p) { return p.tier === tier; });
@@ -345,6 +388,163 @@ function doLogout() {
   document.getElementById('app-view').classList.add('hidden');
   document.getElementById('login-view').classList.remove('hidden');
   bootLogin();
+}
+
+/* ==================== R4-4：IM 绑定登录（钉钉/飞书） ==================== */
+const IM_PROVIDER_META = {
+  dingtalk: { label: '钉钉', color: '#1e88e5' },
+  feishu:   { label: '飞书', color: '#3370ff' },
+};
+let loginPeopleCache = null;   // 登录页人员（免 token 接口拉到，IM 登录选人用）
+let imProvidersCache = null;   // /api/auth/providers 结果（配置弹窗回显用）
+
+/* 登录页入口：未登录拿不到授权 URL（需 token），演示模式下直接选人模拟 IM 身份完成绑定并进入 */
+function imLogin(provider) {
+  const meta = IM_PROVIDER_META[provider] || { label: provider };
+  const people = loginPeopleCache || [];
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">使用' + meta.label + '账号进入</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">真实环境下这里会弹出' + meta.label + '扫码授权；演示环境请直接选择你的身份，' +
+    '系统将模拟' + meta.label + '授权回调并自动绑定。登录后可在侧边栏「IM 绑定」中管理或配置真实应用凭证。</p>' +
+    '<label class="form-label">选择你的身份</label>' +
+    '<select id="im-person" class="form-select">' +
+      people.map(function (p) {
+        return '<option value="' + p.id + '">' + esc(p.name) + ' · ' + esc(p.role_title || '') + '（' + esc(p.dept_name || '') + '）</option>';
+      }).join('') + '</select>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitImLogin(\'' + provider + '\')">模拟' + meta.label + '授权并进入</button></div>');
+}
+async function submitImLogin(provider) {
+  const personId = Number(document.getElementById('im-person').value);
+  if (!personId) { toast('请选择身份', 'error'); return; }
+  try {
+    /* demo 回调为免 token 的同源 JSON 接口，直接 fetch 完成模拟绑定 */
+    const res = await fetch('/api/auth/oauth/' + provider + '/callback?demo=1&person_id=' + personId);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.detail || '授权回调失败');
+    closeModal();
+    toast(data.msg || '绑定成功', 'info');
+    doLogin(data.binding.person_id);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* 主界面：侧边栏「IM 绑定」弹窗 */
+async function openImBindModal() {
+  openModal(loadingHtml('加载绑定信息…'));
+  try {
+    const bindings = await api('/api/auth/bindings');
+    let providers = [];
+    try { providers = await api('/api/auth/providers'); } catch (e) { /* 无权限/失败时按未配置展示 */ }
+    imProvidersCache = providers;
+    const boundMap = {};
+    bindings.forEach(function (b) { boundMap[b.provider] = b; });
+    let html = '<h3 class="font-bold text-primary text-lg mb-1">IM 账号绑定</h3>' +
+      '<p class="text-xs text-gray-500 mb-3">绑定后可在登录页用钉钉/飞书一键进入平台。</p><div class="space-y-3">';
+    Object.keys(IM_PROVIDER_META).forEach(function (pk) {
+      const meta = IM_PROVIDER_META[pk];
+      const b = boundMap[pk];
+      const conf = providers.find(function (x) { return x.provider === pk; });
+      html += '<div class="border border-gray-100 rounded-lg p-3.5">' +
+        '<div class="flex items-center justify-between flex-wrap gap-2">' +
+          '<div class="flex items-center space-x-2"><span class="font-bold" style="color:' + meta.color + '">' + meta.label + '</span>' +
+          (b
+            ? '<span class="badge bg-success">已绑定</span><span class="text-sm text-gray-600">' + esc(b.external_name || '') + '</span>' +
+              '<span class="text-xs text-gray-400">' + fmtTime(b.bound_at) + '</span>'
+            : '<span class="badge bg-gray-400">未绑定</span>') + '</div>' +
+          '<div class="flex space-x-2">' +
+            (b
+              ? '<button class="btn-danger-sm" onclick="unbindIm(\'' + pk + '\')">解绑</button>'
+              : '<button class="btn-success-sm" onclick="startImBind(\'' + pk + '\')">绑定</button>') +
+          '</div></div>' +
+        (conf && !conf.configured ? '<div class="text-[11px] text-gray-400 mt-1.5">未配置应用凭证，当前为演示模式（配置后自动切换真实扫码授权）</div>' : '') +
+        (conf && conf.configured ? '<div class="text-[11px] text-teal mt-1.5">已配置应用凭证，将跳转真实授权</div>' : '') +
+        '</div>';
+    });
+    html += '</div>';
+    if (canAdmin()) {
+      html += '<div class="mt-4 pt-3 border-t border-gray-100 flex justify-end">' +
+        '<button class="btn-ghost !text-xs" onclick="openProviderConfModal()">配置应用凭证</button></div>';
+    }
+    html += '<div class="flex justify-end mt-3"><button class="btn-ghost" onclick="closeModal()">关闭</button></div>';
+    openModal(html);
+  } catch (e) { openModal(errorHtml(e.message)); }
+}
+/* 绑定：先取授权 URL——demo 直接回调完成；真实模式弹二维码给手机扫 */
+async function startImBind(provider) {
+  const meta = IM_PROVIDER_META[provider];
+  try {
+    const r = await api('/api/auth/oauth/' + provider + '/url');
+    if (r.demo) {
+      const res = await fetch(r.url);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.detail || '绑定失败');
+      toast(data.msg || (meta.label + '绑定成功'));
+      openImBindModal();
+    } else {
+      openQrModal(provider, r.url);
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+function openQrModal(provider, url) {
+  const meta = IM_PROVIDER_META[provider];
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">' + meta.label + '扫码授权</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">用手机' + meta.label + '扫码，在手机上确认授权后即完成绑定；回到本页面可重新打开「IM 绑定」查看结果。</p>' +
+    '<div class="flex flex-col items-center py-2"><canvas id="qr-canvas"></canvas>' +
+      '<div id="qr-fallback" class="hidden text-xs text-gray-400 mt-2">二维码组件加载失败，请复制链接到手机打开：</div>' +
+      '<div class="text-[11px] text-gray-400 break-all mt-2 max-w-full">' + esc(url) + '</div></div>' +
+    '<div class="flex justify-end space-x-2 mt-3">' +
+      '<button class="btn-ghost" onclick="openImBindModal()">返回</button>' +
+      '<button class="btn-primary" onclick="openImBindModal()">我已完成授权</button></div>');
+  if (window.QRCode && QRCode.toCanvas) {
+    QRCode.toCanvas(document.getElementById('qr-canvas'), url, { width: 220, margin: 1 }, function (err) {
+      if (err) document.getElementById('qr-fallback').classList.remove('hidden');
+    });
+  } else {
+    document.getElementById('qr-fallback').classList.remove('hidden');
+  }
+}
+async function unbindIm(provider) {
+  const meta = IM_PROVIDER_META[provider];
+  try {
+    await delApi('/api/auth/bindings/' + provider);
+    toast('已解绑' + meta.label);
+    openImBindModal();
+  } catch (e) { toast(e.message, 'error'); }
+}
+/* boss/coach：配置应用凭证（app_id/app_secret/redirect_uri/enabled） */
+function openProviderConfModal() {
+  const providers = imProvidersCache || [];
+  let html = '<h3 class="font-bold text-primary text-lg mb-1">配置 IM 应用凭证</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">在钉钉/飞书开放平台创建应用后填入；密钥只存服务端、不回显。填齐并启用后，绑定自动切换为真实扫码授权。</p>' +
+    '<div class="space-y-4">';
+  providers.forEach(function (p) {
+    const meta = IM_PROVIDER_META[p.provider] || { label: p.provider };
+    html += '<div class="border border-gray-100 rounded-lg p-3.5" id="conf-' + p.provider + '">' +
+      '<div class="flex items-center justify-between mb-2"><span class="font-bold" style="color:' + (meta.color || '#1a365d') + '">' + meta.label + '</span>' +
+      '<label class="inline-flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer"><input type="checkbox" id="cf-' + p.provider + '-enabled" class="accent-secondary"' + (p.enabled ? ' checked' : '') + '>启用</label></div>' +
+      '<div class="grid grid-cols-2 gap-2">' +
+        '<div><label class="form-label">App ID</label><input id="cf-' + p.provider + '-appid" class="form-input !text-xs" value="' + esc(p.app_id || '') + '"></div>' +
+        '<div><label class="form-label">App Secret</label><input id="cf-' + p.provider + '-secret" type="password" class="form-input !text-xs" placeholder="' + (p.app_secret === '已配置' ? '已配置（留空保持不变）' : '填入密钥') + '"></div></div>' +
+      '<div class="mt-2"><label class="form-label">回调地址（留空用默认）</label><input id="cf-' + p.provider + '-redirect" class="form-input !text-xs font-mono" value="' + esc(p.redirect_uri || '') + '" placeholder="http://localhost:8000/api/auth/oauth/' + p.provider + '/callback"></div>' +
+      '<div class="flex justify-end mt-2"><button class="btn-primary !py-1 !px-3 !text-xs" onclick="submitProviderConf(\'' + p.provider + '\')">保存' + meta.label + '配置</button></div>' +
+      '</div>';
+  });
+  html += '</div><div class="flex justify-end mt-4"><button class="btn-ghost" onclick="openImBindModal()">返回</button></div>';
+  openModal(html);
+}
+async function submitProviderConf(provider) {
+  const body = { enabled: document.getElementById('cf-' + provider + '-enabled').checked };
+  const appid = document.getElementById('cf-' + provider + '-appid').value.trim();
+  const secret = document.getElementById('cf-' + provider + '-secret').value.trim();
+  const redirect = document.getElementById('cf-' + provider + '-redirect').value.trim();
+  if (appid) body.app_id = appid;
+  if (secret) body.app_secret = secret;
+  if (redirect) body.redirect_uri = redirect;
+  try {
+    await putApi('/api/auth/providers/' + provider, body);
+    toast((IM_PROVIDER_META[provider] || {}).label + ' 应用凭证已保存');
+    openImBindModal();
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 /* ==================== 心跳 ==================== */
@@ -597,6 +797,7 @@ async function loadWorkspacePanel() {
     }).join('') +
     '</div></div>' +
     '<div class="px-4 py-1.5 bg-teal/5 text-xs text-teal border-b border-gray-100 shrink-0">💡 ' + esc(z.name) + '：' + esc(z.desc) + '</div>' +
+    '<div id="chain-bar" class="shrink-0"></div>' +
     '<div id="msg-list" class="flex-1 overflow-y-auto chat-scroll px-4 py-3 bg-gray-50/50"></div>' +
     /* 输入区 */
     '<div class="p-3 border-t border-gray-100 shrink-0 relative">' +
@@ -645,6 +846,67 @@ async function loadMessages(scrollToDeliverable) {
   } else {
     box.scrollTop = box.scrollHeight;
   }
+  refreshChainBar();   // R4-6：链路条随消息列表一起刷新（发消息/审核后同此入口）
+}
+/* ---------- R4-6：Agent 执行链路横条（过去→现在→未来） ---------- */
+async function refreshChainBar() {
+  const bar = document.getElementById('chain-bar');
+  if (!bar) return;
+  if (wsState.zone !== 'agent') { bar.innerHTML = ''; return; }
+  try {
+    const ch = await api('/api/workspaces/' + wsState.id + '/chain');
+    /* 无链路数据（无过去且无未来）时隐藏横条 */
+    if (!(ch.past || []).length && !(ch.future || []).length) { bar.innerHTML = ''; return; }
+    bar.innerHTML = chainBarHtml(ch);
+  } catch (e) { bar.innerHTML = ''; /* 链路拉取失败不阻塞聊天 */ }
+}
+function chainBarHtml(ch) {
+  const nodes = [];
+  (ch.past || []).forEach(function (p) {
+    const rejected = p.status === '已驳回';
+    nodes.push({
+      cls: 'cn-past' + (rejected ? ' rejected' : ''),
+      icon: rejected ? '❌' : '✅',
+      title: p.title || '',
+      sub: (p.agent_name || '') + ' · ' + fmtTime(p.time),
+      tip: '【过去】' + (p.title || '') + '\n状态：' + (p.status || '-') + ' · 数字员工：' + (p.agent_name || '-') +
+        '\n时间：' + fmtTime(p.time) + (p.version ? ' · 交付版本 v' + p.version : ''),
+    });
+  });
+  (ch.present || []).forEach(function (p) {
+    nodes.push({
+      cls: 'cn-present',
+      icon: '🔵',
+      title: p.title || '',
+      sub: (p.agent_name || '') + ' · ' + (p.status || ''),
+      tip: '【当前】' + (p.title || '') + '\n状态：' + (p.status || '-') + ' · 数字员工：' + (p.agent_name || '-') +
+        '\n优先级：' + (p.priority || '-') + (p.deadline ? ' · 截止：' + fmtTime(p.deadline) : '') + (p.version ? ' · 交付版本 v' + p.version : ''),
+    });
+  });
+  (ch.future || []).forEach(function (f) {
+    nodes.push({
+      cls: 'cn-future',
+      icon: '⚪',
+      title: (f.code ? f.code + ' ' : '') + (f.title || ''),
+      sub: (f.role_name || '') + ' · ' + (f.status || ''),
+      tip: '【未来】流程节点 ' + (f.code || '') + '：' + (f.title || '') + '\n负责角色：' + (f.role_name || '-') +
+        ' · 阶段' + (f.stage || '-') + ' · 状态：' + (f.status || '-'),
+    });
+  });
+  let strip = '';
+  nodes.forEach(function (n, i) {
+    if (i) strip += '<div class="chain-link"></div>';
+    strip += '<div class="chain-node ' + n.cls + '" title="' + esc(n.tip) + '">' +
+      '<div class="flex items-center gap-1"><span>' + n.icon + '</span>' +
+      '<span class="font-bold text-[11px] truncate">' + esc(n.title) + '</span></div>' +
+      '<div class="text-[10px] text-gray-400 truncate mt-0.5">' + esc(n.sub) + '</div></div>';
+  });
+  return '<div class="px-4 py-2 border-b border-gray-100 bg-white">' +
+    '<div class="flex items-center gap-2 mb-1"><span class="text-[11px] font-bold text-gray-500">执行链路</span>' +
+    '<span class="text-[10px] text-gray-300">过去 ✅ → 现在 🔵 → 未来 ⚪</span></div>' +
+    '<div class="chain-strip">' + strip +
+    (ch.flow_id ? '<div class="chain-link"></div><div class="chain-flow" onclick="gotoFlow(' + ch.flow_id + ')" title="打开项目流程泳道">查看完整流程 →</div>' : '') +
+    '</div></div>';
 }
 const ROBOT_SVG = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v3M5 8h14a1 1 0 011 1v9a2 2 0 01-2 2H6a2 2 0 01-2-2V9a1 1 0 011-1zM9 13v2M15 13v2"/></svg>';
 function messageHtml(m) {
@@ -788,16 +1050,27 @@ function agentFiltersHtml() {
     '<select id="f-category" class="form-select !w-44"><option value="">全部方向</option>' +
       AGENT_CATEGORY_LIST.map(function (s) { return '<option>' + s + '</option>'; }).join('') + '</select>' +
     '<button class="btn-primary" onclick="loadAgents()">筛选</button>' +
-    '<button class="btn-ghost" onclick="resetAgentFilters()">重置</button></div>';
+    '<button class="btn-ghost" onclick="resetAgentFilters()">重置</button>' +
+    (canCreateAgent()
+      ? '<div class="flex-1"></div><button class="btn-primary !bg-accent hover:!bg-accent/90" onclick="openAgentFormModal()">+ 新建数字员工</button>'
+      : '') + '</div>';
 }
 async function renderAgents(c) {
-  c.innerHTML = agentFiltersHtml() + '<div id="agents-grid">' + loadingHtml('加载数字员工…') + '</div>';
+  c.innerHTML = '<div id="model-default-card"></div>' + agentFiltersHtml() + '<div id="agents-grid">' + loadingHtml('加载数字员工…') + '</div>';
   await ensurePlatforms();
+  try { await ensureModelsCache(); } catch (e) { cache.models = []; }
+  renderModelDefaultCard();
   const sel = document.getElementById('f-platform');
   (cache.platforms || []).forEach(function (p) {
     const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; sel.appendChild(o);
   });
   await loadAgents();
+  /* 深链：#/agents/<id> 直接打开档案抽屉；#/agents/new 直接打开新建弹窗（分享与验收直达） */
+  const parts = (location.hash || '').replace(/^#\/?/, '').split('/');
+  if (parts[0] === 'agents') {
+    if (parts[1] === 'new' && canCreateAgent()) openAgentFormModal();
+    else if (Number(parts[1])) openAgentDrawer(Number(parts[1]));
+  }
 }
 async function ensurePlatforms() {
   if (cache.platforms) return;
@@ -807,6 +1080,36 @@ async function ensurePlatforms() {
   tree.forEach(function (p) {
     (p.departments || []).forEach(function (d) { cache.depts.push({ id: d.id, name: d.name, platform_name: p.name }); });
   });
+}
+/* R4 缓存：模型供应商 / Skill / MCP 台账 */
+async function ensureModelsCache(force) {
+  if (cache.models && !force) return;
+  cache.models = await api('/api/models');
+}
+async function ensureSkillsCache(force) {
+  if (cache.skills && !force) return;
+  cache.skills = await api('/api/skills');
+}
+async function ensureMcpCache(force) {
+  if (cache.mcp && !force) return;
+  cache.mcp = await api('/api/mcp');
+}
+function defaultProvider() {
+  return (cache.models || []).find(function (m) { return m.is_default; }) || null;
+}
+/* 模型下拉选项：空白=跟随全局默认；每个供应商标注 默认/Key 状态/停用 */
+function modelOptionsHtml(selected) {
+  const def = defaultProvider();
+  let opts = '<option value="">跟随全局默认' + (def ? '（' + esc(def.name) + '）' : '') + '</option>';
+  (cache.models || []).forEach(function (m) {
+    const tags = [m.name];
+    if (m.is_default) tags.push('默认');
+    tags.push(m.api_key === '已配置' ? '已配置Key' : '未配置Key');
+    if (!m.enabled) tags.push('已停用');
+    opts += '<option value="' + esc(m.key) + '"' + (selected === m.key ? ' selected' : '') +
+      (m.enabled ? '' : ' disabled') + '>' + esc(tags.join(' · ')) + '</option>';
+  });
+  return opts;
 }
 async function loadAgents() {
   const box = document.getElementById('agents-grid');
@@ -839,16 +1142,54 @@ function resetAgentFilters() {
   ['platform', 'status', 'wave', 'category'].forEach(function (k) { document.getElementById('f-' + k).value = ''; });
   loadAgents();
 }
+/* R4-1：数字员工视图顶部"全局默认模型"小卡（boss/coach 可切换） */
+function renderModelDefaultCard() {
+  const box = document.getElementById('model-default-card');
+  if (!box) return;
+  const def = defaultProvider() || {};
+  let html = '<div class="data-card !p-3 mb-4 flex flex-wrap items-center gap-2 text-sm">' +
+    '<span class="font-bold text-primary">全局默认模型</span>' +
+    '<span class="badge bg-secondary">' + esc(def.name || '未设置') + '</span>' +
+    '<span class="text-xs text-gray-400">' + esc(def.default_model || '') +
+    (def.name ? ' · ' + (def.api_key === '已配置' ? '已配置 Key' : '未配置 Key（生成交付物时回落内置模板）') : '') + '</span>';
+  if (canAdmin()) {
+    html += '<span class="flex-1"></span>' +
+      '<select id="global-model-sel" class="form-select !w-60">' +
+      (cache.models || []).map(function (m) {
+        return '<option value="' + esc(m.key) + '"' + (m.is_default ? ' selected' : '') + (m.enabled ? '' : ' disabled') + '>' +
+          esc(m.name) + '（' + esc(m.default_model || '-') + '）' + (m.enabled ? '' : '【已停用】') + '</option>';
+      }).join('') + '</select>' +
+      '<button class="btn-primary" onclick="saveGlobalModel()">设为默认</button>';
+  } else {
+    html += '<span class="flex-1"></span><span class="text-xs text-gray-400">切换默认模型需高管/教练团权限</span>';
+  }
+  box.innerHTML = html + '</div>';
+}
+async function saveGlobalModel() {
+  const key = document.getElementById('global-model-sel').value;
+  try {
+    const r = await putApi('/api/models/default', { key: key });
+    const chosen = (r.providers || []).find(function (m) { return m.key === key; });
+    toast('全局默认模型已切换为：' + (chosen ? chosen.name : key));
+    await ensureModelsCache(true);
+    renderModelDefaultCard();
+  } catch (e) { toast(e.message, 'error'); }
+}
+let drawerAgentId = null;   // 当前抽屉中的数字员工 id（配置 Key 后局部刷新模型区用）
 async function openAgentDrawer(id) {
+  drawerAgentId = id;
   openDrawer(loadingHtml('加载档案…'));
   try {
     const a = await api('/api/agents/' + id);
+    try { await ensureModelsCache(); } catch (e) { cache.models = cache.models || []; }
     let html = '<div class="p-5">' +
       '<div class="flex items-start justify-between">' +
         '<div class="flex items-center space-x-3"><div class="msg-avatar bg-teal !w-11 !h-11">' + ROBOT_SVG + '</div>' +
           '<div><div class="font-black text-lg text-primary">' + esc(a.name) + '</div>' +
           '<div class="text-xs text-gray-500">' + esc(a.code || '') + ' · ' + esc(a.dept_name || '') + '</div></div></div>' +
-        '<button onclick="closeDrawer()" class="text-gray-400 hover:text-gray-700"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg></button></div>' +
+        '<div class="flex items-center space-x-2 shrink-0">' +
+          (canEditAgent(a) ? '<button class="btn-ghost !py-1 !px-2.5 text-xs" onclick="openAgentFormModal(' + a.id + ')">编辑</button>' : '') +
+          '<button onclick="closeDrawer()" class="text-gray-400 hover:text-gray-700"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg></button></div></div>' +
       '<div class="flex flex-wrap gap-1.5 mt-3">' + statusBadge(a.status, AGENT_STATUS_META) +
         '<span class="badge bg-primary">第' + (a.wave ?? '-') + '波</span>' +
         '<span class="badge badge-outline">' + esc(a.category || '-') + '</span></div>' +
@@ -863,6 +1204,16 @@ async function openAgentDrawer(id) {
       '<div class="mt-3"><div class="text-xs font-bold text-gray-500 mb-1.5">技能标签云</div><div class="flex flex-wrap gap-1.5">' +
         ((a.skills || []).length ? a.skills.map(function (s) { return '<span class="badge bg-secondary">' + esc(s) + '</span>'; }).join('') : '<span class="text-xs text-gray-400">暂无技能标签</span>') +
       '</div></div>' +
+      /* R4-1：模型区 */
+      '<div class="mt-4" id="agent-model-box">' + agentModelBoxHtml(a) + '</div>' +
+      /* R4-2：MCP 服务区 */
+      '<div class="mt-4"><div class="text-xs font-bold text-gray-500 mb-1.5">MCP 服务（' + (a.mcp || []).length + '）</div>' +
+        ((a.mcp || []).length ? '<div class="space-y-1.5">' + a.mcp.map(function (m) {
+          return '<div class="border border-gray-100 rounded-lg px-3 py-2">' +
+            '<div class="flex items-center justify-between"><span class="text-sm font-medium">' + esc(m.name) + '</span>' +
+            statusBadge(m.status, { '启用': 'bg-success', '停用': 'bg-gray-400' }) + '</div>' +
+            '<div class="text-xs text-gray-400 mt-0.5 font-mono">' + esc(m.endpoint || '') + '</div></div>';
+        }).join('') + '</div>' : '<div class="text-xs text-gray-400">未绑定 MCP 服务，可在「编辑」中选择</div>') + '</div>' +
       '<div class="mt-4"><div class="text-xs font-bold text-gray-500 mb-1.5">绑定场景（' + (a.scenarios || []).length + '）</div>' +
         ((a.scenarios || []).length ? '<div class="space-y-1.5">' + a.scenarios.map(function (s) {
           return '<div class="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2 text-sm">' +
@@ -896,7 +1247,170 @@ async function openAgentDrawer(id) {
   } catch (e) { openDrawer(errorHtml(e.message)); }
 }
 
-/* ==================== 视图 4：场景库 ==================== */
+/* ---------- R4-1：模型选择 / Key 配置 ---------- */
+function agentModelBoxHtml(a) {
+  const editable = canEditAgent(a);
+  return '<div class="text-xs font-bold text-gray-500 mb-1.5">模型</div>' +
+    '<div class="flex items-center gap-2">' +
+      '<select class="form-select" id="agent-model-sel"' +
+        (editable ? ' onchange="saveAgentModel(' + a.id + ', this.value)"' : ' disabled') + '>' +
+        modelOptionsHtml(a.model_key || '') + '</select>' +
+      (canAdmin() ? '<button class="btn-ghost !py-1.5 !px-2.5 text-xs shrink-0" title="配置模型供应商的 API Key" onclick="openModelKeyModal()">配置 Key</button>' : '') +
+    '</div>' +
+    '<div class="text-[11px] text-gray-400 mt-1">' +
+      (editable ? '未配置 Key 或已停用的模型，生成交付物时自动回落内置模板' : '仅高管/教练团或负责人本人可调整模型') + '</div>';
+}
+async function saveAgentModel(agentId, key) {
+  try {
+    await patchApi('/api/agents/' + agentId, { model_key: key || '' });
+    toast(key ? '已切换模型，下次生成交付物生效' : '已恢复跟随全局默认模型');
+  } catch (e) {
+    toast(e.message, 'error');
+    if (drawerAgentId) openAgentDrawer(drawerAgentId);   // 失败回退选中态
+  }
+}
+function openModelKeyModal() {
+  const curSel = document.getElementById('agent-model-sel');
+  const preKey = (curSel && curSel.value) || (defaultProvider() || {}).key || '';
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">配置模型供应商</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">Key 只保存在服务端，这里永远看不到明文；留空的字段不会被修改。</p>' +
+    '<div class="space-y-3">' +
+      '<div><label class="form-label">供应商</label><select id="mk-provider" class="form-select" onchange="fillModelKeyForm()">' +
+        (cache.models || []).map(function (m) {
+          return '<option value="' + esc(m.key) + '"' + (m.key === preKey ? ' selected' : '') + '>' + esc(m.name) + '</option>';
+        }).join('') + '</select></div>' +
+      '<div><label class="form-label">API Key</label><input id="mk-key" class="form-input" type="password" placeholder="">' +
+        '<div id="mk-key-state" class="text-[11px] text-gray-400 mt-1"></div></div>' +
+      '<div><label class="form-label">默认模型名</label><input id="mk-model" class="form-input" placeholder=""></div>' +
+      '<label class="inline-flex items-center gap-2 text-sm text-gray-600 cursor-pointer">' +
+        '<input type="checkbox" id="mk-enabled" class="accent-secondary">启用该供应商（停用后引用它的数字员工回落模板）</label>' +
+    '</div>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitModelKey()">保存配置</button></div>');
+  fillModelKeyForm();
+}
+function fillModelKeyForm() {
+  const key = document.getElementById('mk-provider').value;
+  const m = (cache.models || []).find(function (x) { return x.key === key; }) || {};
+  document.getElementById('mk-key').placeholder = m.api_key === '已配置' ? '已配置（留空保持不变）' : '粘贴 API Key';
+  document.getElementById('mk-key-state').textContent = '当前状态：' + (m.api_key || '未配置') + ' · 接口 ' + (m.base_url || '-');
+  document.getElementById('mk-model').placeholder = m.default_model || '如 glm-4-flash';
+  document.getElementById('mk-enabled').checked = !!m.enabled;
+}
+async function submitModelKey() {
+  const key = document.getElementById('mk-provider').value;
+  const body = { enabled: document.getElementById('mk-enabled').checked };
+  const apiKey = document.getElementById('mk-key').value.trim();
+  const model = document.getElementById('mk-model').value.trim();
+  if (apiKey) body.api_key = apiKey;
+  if (model) body.default_model = model;
+  try {
+    await putApi('/api/models/' + key, body);
+    closeModal();
+    toast('模型供应商配置已保存');
+    await ensureModelsCache(true);
+    renderModelDefaultCard();
+    if (drawerAgentId && document.getElementById('agent-model-box')) {
+      const a = await api('/api/agents/' + drawerAgentId);
+      document.getElementById('agent-model-box').innerHTML = agentModelBoxHtml(a);
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ---------- R4-2：新建 / 编辑数字员工 ---------- */
+async function openAgentFormModal(agentId) {
+  await ensurePlatforms();
+  await Promise.all([ensureSkillsCache(), ensureMcpCache(), ensureModelsCache()]);
+  let a = null;
+  if (agentId) a = await api('/api/agents/' + agentId);
+  const skillSet = {}; ((a && a.skills) || []).forEach(function (s) { skillSet[s] = 1; });
+  const mcpSet = {}; ((a && a.mcp_ids) || []).forEach(function (i) { mcpSet[i] = 1; });
+  const categories = AGENT_CATEGORY_LIST.filter(function (x) { return x !== '通用'; });
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">' + (a ? '编辑数字员工' : '新建数字员工') + '</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">' + (a ? '修改档案信息，保存后立即生效。' : '编号自动生成，初始状态为「规划中」，可稍后在档案中调整。') + '</p>' +
+    '<div class="space-y-3">' +
+      '<div class="grid grid-cols-2 gap-3">' +
+        '<div><label class="form-label">名称 *</label><input id="af-name" class="form-input" placeholder="如：单证审核数字员工" value="' + esc(a ? a.name : '') + '"></div>' +
+        '<div><label class="form-label">所属部门 *</label><select id="af-dept" class="form-select">' +
+          (cache.depts || []).map(function (d) {
+            return '<option value="' + d.id + '"' + (a && a.dept_id === d.id ? ' selected' : '') + '>' + esc(d.platform_name) + ' / ' + esc(d.name) + '</option>';
+          }).join('') + '</select></div></div>' +
+      '<div class="grid grid-cols-2 gap-3">' +
+        '<div><label class="form-label">方向</label><select id="af-category" class="form-select">' +
+          categories.map(function (x) {
+            return '<option' + (a && a.category === x ? ' selected' : '') + '>' + x + '</option>';
+          }).join('') + '</select></div>' +
+        '<div><label class="form-label">模型</label><select id="af-model" class="form-select">' + modelOptionsHtml((a && a.model_key) || '') + '</select></div></div>' +
+      '<div><label class="form-label">描述</label><textarea id="af-desc" class="form-textarea" rows="2" placeholder="这个数字员工负责什么、怎么用它">' + esc(a ? (a.description || '') : '') + '</textarea></div>' +
+      '<div><label class="form-label">技能（多选）</label><div class="border border-gray-200 rounded-lg p-2.5 max-h-32 overflow-y-auto grid grid-cols-2 gap-1">' +
+        (cache.skills || []).map(function (s) {
+          return '<label class="inline-flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">' +
+            '<input type="checkbox" name="af-skill" value="' + esc(s.name) + '"' + (skillSet[s.name] ? ' checked' : '') + ' class="accent-secondary">' + esc(s.name) + '</label>';
+        }).join('') + '</div></div>' +
+      '<div><label class="form-label">MCP 服务（多选）</label><div class="border border-gray-200 rounded-lg p-2.5 space-y-1">' +
+        ((cache.mcp || []).length ? cache.mcp.map(function (m) {
+          return '<label class="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">' +
+            '<input type="checkbox" name="af-mcp" value="' + m.id + '"' + (mcpSet[m.id] ? ' checked' : '') + ' class="accent-secondary">' +
+            '<span class="font-medium">' + esc(m.name) + '</span><span class="text-gray-400 font-mono">' + esc(m.endpoint || '') + '</span>' +
+            (m.status === '停用' ? '<span class="badge bg-gray-400">停用</span>' : '') + '</label>';
+        }).join('') : '<div class="text-xs text-gray-400">暂无 MCP 服务，可先在「Skill 库」底部的 MCP 台账中登记</div>') + '</div></div>' +
+    '</div>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitAgentForm(' + (a ? a.id : 0) + ')">' + (a ? '保存修改' : '创建') + '</button></div>');
+}
+async function submitAgentForm(agentId) {
+  const body = {
+    name: document.getElementById('af-name').value.trim(),
+    dept_id: Number(document.getElementById('af-dept').value),
+    category: document.getElementById('af-category').value,
+    description: document.getElementById('af-desc').value.trim(),
+    model_key: document.getElementById('af-model').value || '',
+    skills: Array.prototype.map.call(document.querySelectorAll('input[name="af-skill"]:checked'), function (el) { return el.value; }),
+    mcp_ids: Array.prototype.map.call(document.querySelectorAll('input[name="af-mcp"]:checked'), function (el) { return Number(el.value); }),
+  };
+  if (!body.name) { toast('请填写名称', 'error'); return; }
+  try {
+    if (agentId) {
+      await patchApi('/api/agents/' + agentId, body);
+      closeModal();
+      toast('数字员工档案已更新');
+      openAgentDrawer(agentId);
+    } else {
+      const r = await postApi('/api/agents', body);
+      closeModal();
+      toast('数字员工「' + r.name + '」已创建（' + (r.code || '') + '）');
+      cache.agents = null;   // 让协作空间 @ 候选等用到缓存的地方下次重新拉取
+    }
+    const grid = document.getElementById('agents-grid');
+    if (grid) loadAgents();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ==================== 视图 4：场景库（R4-5：平台/部门分组 + 推荐排序） ==================== */
+const scenState = { sort: 'recommend' };   // recommend=推荐排序 benefit=按预期收益 priority=按优先级
+const SCEN_PRI_W = { '高': 3, '中': 2, '低': 1 };
+/* 从 "12.24万/年" / "预估3万/年" 等文本中解析收益数值（万元） */
+function scenBenefitValue(s) {
+  const t = String(s.expected_benefit || '');
+  let m = t.match(/([\d.]+)\s*万/);
+  if (m) return parseFloat(m[1]) || 0;
+  m = t.match(/([\d.]+)/);
+  if (m) {
+    const v = parseFloat(m[1]) || 0;
+    return v > 1000 ? v / 10000 : v;   // 无"万"字的大数按元折算
+  }
+  return 0;
+}
+/* 推荐分 = 优先级(高3/中2/低1) + 收益归一化(0-2) + 首批试点加成(2) */
+function scenScore(s, maxBen) {
+  return (SCEN_PRI_W[s.priority] || 0) + (maxBen > 0 ? scenBenefitValue(s) / maxBen * 2 : 0) + (s.batch === '首批' ? 2 : 0);
+}
+function setScenSort(v) {
+  scenState.sort = v;
+  loadScenarios();
+}
 function scenarioFiltersHtml() {
   return '<div class="data-card !p-3 flex flex-wrap items-center gap-2 mb-4">' +
     '<select id="sf-platform" class="form-select !w-40"><option value="">全部平台</option></select>' +
@@ -905,6 +1419,11 @@ function scenarioFiltersHtml() {
     '<select id="sf-priority" class="form-select !w-32"><option value="">全部优先级</option><option>高</option><option>中</option><option>低</option></select>' +
     '<button class="btn-primary" onclick="loadScenarios()">筛选</button>' +
     '<button class="btn-ghost" onclick="resetScenarioFilters()">重置</button>' +
+    '<span class="text-xs text-gray-400 ml-2">排序</span>' +
+    '<select id="sf-sort" class="form-select !w-36" onchange="setScenSort(this.value)">' +
+      '<option value="recommend"' + (scenState.sort === 'recommend' ? ' selected' : '') + '>推荐排序</option>' +
+      '<option value="benefit"' + (scenState.sort === 'benefit' ? ' selected' : '') + '>按预期收益</option>' +
+      '<option value="priority"' + (scenState.sort === 'priority' ? ' selected' : '') + '>按优先级</option></select>' +
     '<div class="flex-1"></div>' +
     '<button class="btn-primary !bg-accent hover:!bg-accent/90" onclick="openScenarioModal()">+ 新建场景</button></div>';
 }
@@ -932,32 +1451,81 @@ async function loadScenarios() {
   if (st) qs.set('status', st);
   if (pr) qs.set('priority', pr);
   try {
-    let list = await api('/api/scenarios' + (qs.toString() ? '?' + qs : ''));
+    const list = await api('/api/scenarios' + (qs.toString() ? '?' + qs : ''));
     /* 已立项场景 → 项目流程 id 映射（操作列"流程"跳转按钮用；接口不可用时静默降级） */
     let flowMap = {};
     try { (await api('/api/flows')).forEach(function (f) { flowMap[f.scenario_id] = f.id; }); } catch (e) {}
-    /* 首批试点置顶 */
-    list = list.slice().sort(function (a, b) { return (b.batch === '首批' ? 1 : 0) - (a.batch === '首批' ? 1 : 0); });
     if (!list.length) { box.innerHTML = '<div class="data-card">' + emptyHtml('暂无场景，点击右上角「新建场景」发起申报') + '</div>'; return; }
-    box.innerHTML = '<div class="data-card !p-0 overflow-x-auto"><table class="gov-table w-full"><thead><tr>' +
-      '<th>场景名称</th><th>部门</th><th>数字员工</th><th>优先级</th><th>批次</th><th>预期收益</th><th>状态</th><th>操作</th>' +
-      '</tr></thead><tbody>' + list.map(function (s) {
-        return '<tr>' +
-          '<td><div class="flex items-center gap-1.5"><span class="font-medium">' + esc(s.name) + '</span>' +
-            (s.batch === '首批' ? '<span class="badge badge-gold">首批试点</span>' : '') + '</div>' +
-            '<div class="text-xs text-gray-400 mt-0.5 max-w-xs truncate" title="' + esc(s.description || '') + '">' + esc(s.description || '') + '</div></td>' +
-          '<td class="whitespace-nowrap">' + esc(s.dept_name || '-') + '</td>' +
-          '<td class="whitespace-nowrap">' + (s.agent_name ? esc(s.agent_name) : '<span class="text-gray-400">未绑定</span>') + '</td>' +
-          '<td>' + priorityBadge(s.priority) + '</td>' +
-          '<td class="whitespace-nowrap">' + esc(s.batch || '-') + '</td>' +
-          '<td class="whitespace-nowrap">' + esc(s.expected_benefit || '-') + '</td>' +
-          '<td>' + statusBadge(s.status, SCENARIO_STATUS_META) + '</td>' +
-          '<td class="whitespace-nowrap">' + (s.status === '待立项'
-            ? '<button class="btn-success-sm" onclick="initiateScenario(' + s.id + ')">敏捷立项</button>'
-            : (flowMap[s.id]
-              ? '<button class="btn-ghost !py-1 !px-2.5 !text-xs" title="查看该场景的项目流程泳道" onclick="gotoFlow(' + flowMap[s.id] + ')">流程</button>'
-              : '<span class="text-xs text-gray-300">—</span>')) + '</td></tr>';
-      }).join('') + '</tbody></table></div>';
+    /* R4-5：收益归一化的分母 = 当前筛选结果中的最大收益 */
+    let maxBen = 0;
+    list.forEach(function (s) { maxBen = Math.max(maxBen, scenBenefitValue(s)); });
+    /* 平台分组 → 部门子分组；排序在部门组内进行（推荐/收益/优先级） */
+    const sortFn = {
+      recommend: function (a, b) { return scenScore(b, maxBen) - scenScore(a, maxBen); },
+      benefit:   function (a, b) { return scenBenefitValue(b) - scenBenefitValue(a); },
+      priority:  function (a, b) { return (SCEN_PRI_W[b.priority] || 0) - (SCEN_PRI_W[a.priority] || 0) || scenBenefitValue(b) - scenBenefitValue(a); },
+    }[scenState.sort] || function () { return 0; };
+    const platMap = {};
+    list.forEach(function (s) {
+      const k = s.platform_id || 0;
+      if (!platMap[k]) platMap[k] = { name: s.platform_name || '其他', items: [] };
+      platMap[k].items.push(s);
+    });
+    const platOrder = (cache.platforms || []).map(function (p) { return p.id; });
+    const platKeys = Object.keys(platMap).map(Number).sort(function (a, b) {
+      const ia = platOrder.indexOf(a), ib = platOrder.indexOf(b);
+      return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
+    });
+    let html = '';
+    platKeys.forEach(function (pk) {
+      const g = platMap[pk];
+      const pilotCnt = g.items.filter(function (s) { return s.status === '试点中'; }).length;
+      const deptMap = {};
+      g.items.forEach(function (s) {
+        const dk = s.dept_id || 0;
+        if (!deptMap[dk]) deptMap[dk] = { name: s.dept_name || '未分配部门', items: [] };
+        deptMap[dk].items.push(s);
+      });
+      const deptKeys = Object.keys(deptMap).map(Number).sort(function (a, b) { return a - b; });
+      /* 平台大区块标题：平台名 + 场景数 + 试点数；默认展开可折叠 */
+      html += '<details class="tree-platform data-card !p-0 mb-4" open><summary class="flex items-center space-x-3 px-4 py-3">' +
+        '<span class="tree-arrow text-gray-400">▶</span>' +
+        '<span class="font-bold text-primary">' + esc(g.name) + '</span>' +
+        '<span class="badge bg-secondary">场景 ' + g.items.length + '</span>' +
+        (pilotCnt ? '<span class="badge bg-teal">试点中 ' + pilotCnt + '</span>' : '<span class="text-xs text-gray-400">暂无试点</span>') +
+        '</summary><div class="px-4 pb-4 space-y-3">';
+      deptKeys.forEach(function (dk) {
+        const dg = deptMap[dk];
+        const items = dg.items.slice().sort(sortFn);
+        html += '<div class="border border-gray-100 rounded-lg overflow-hidden">' +
+          '<div class="flex items-center space-x-2 px-3 py-2 bg-gray-50 border-b border-gray-100">' +
+            '<span class="text-sm font-bold text-secondary">' + esc(dg.name) + '</span>' +
+            '<span class="text-xs text-gray-400">' + items.length + ' 个场景</span></div>' +
+          '<div class="overflow-x-auto"><table class="gov-table w-full"><thead><tr>' +
+            '<th>场景名称</th><th>数字员工</th><th>优先级</th><th>批次</th><th>预期收益</th><th>状态</th><th>操作</th>' +
+            '</tr></thead><tbody>' +
+          items.map(function (s) {
+            const hot = scenScore(s, maxBen) >= 5;
+            return '<tr>' +
+              '<td><div class="flex items-center gap-1.5 flex-wrap"><span class="font-medium">' + esc(s.name) + '</span>' +
+                (hot ? '<span class="badge bg-danger" title="推荐分≥5：优先级高/收益高/首批试点">🔥重点推荐</span>' : '') +
+                (s.batch === '首批' ? '<span class="badge badge-gold">首批试点</span>' : '') + '</div>' +
+                '<div class="text-xs text-gray-400 mt-0.5 max-w-xs truncate" title="' + esc(s.description || '') + '">' + esc(s.description || '') + '</div></td>' +
+              '<td class="whitespace-nowrap">' + (s.agent_name ? esc(s.agent_name) : '<span class="text-gray-400">未绑定</span>') + '</td>' +
+              '<td>' + priorityBadge(s.priority) + '</td>' +
+              '<td class="whitespace-nowrap">' + esc(s.batch || '-') + '</td>' +
+              '<td class="whitespace-nowrap">' + esc(s.expected_benefit || '-') + '</td>' +
+              '<td>' + statusBadge(s.status, SCENARIO_STATUS_META) + '</td>' +
+              '<td class="whitespace-nowrap">' + (s.status === '待立项'
+                ? '<button class="btn-success-sm" onclick="initiateScenario(' + s.id + ')">敏捷立项</button>'
+                : (flowMap[s.id]
+                  ? '<button class="btn-ghost !py-1 !px-2.5 !text-xs" title="查看该场景的项目流程泳道" onclick="gotoFlow(' + flowMap[s.id] + ')">流程</button>'
+                  : '<span class="text-xs text-gray-300">—</span>')) + '</td></tr>';
+          }).join('') + '</tbody></table></div></div>';
+      });
+      html += '</div></details>';
+    });
+    box.innerHTML = html;
   } catch (e) { box.innerHTML = errorHtml(e.message); }
 }
 async function initiateScenario(id) {
@@ -1129,10 +1697,14 @@ function submitTaskReview(id, action) {
   reviewTaskAction(id, action, comment);
 }
 
-/* ==================== 视图 6：Skill 库 ==================== */
+/* ==================== 视图 6：Skill 库（含 MCP 服务台账） ==================== */
 async function renderSkills(c) {
   c.innerHTML = loadingHtml('加载 Skill 资产…');
   const list = await api('/api/skills');
+  cache.skills = list;
+  let mcpList = [];
+  try { mcpList = await api('/api/mcp'); } catch (e) { /* 台账拉取失败不阻塞 Skill 展示 */ }
+  cache.mcp = mcpList;
   const scopes = ['公开', '组织', '个人'];
   const scopeMeta = { '公开': 'bg-success', '组织': 'bg-secondary', '个人': 'bg-accent' };
   const scopeEmpty = {
@@ -1140,7 +1712,9 @@ async function renderSkills(c) {
     '组织': '暂无组织级 Skill，好用的团队话术可以沉淀到这里',
     '个人': '还没有个人技能，把你常用的 AI 话术沉淀到这里',
   };
-  let html = '';
+  let html = '<div class="flex items-center justify-between mb-4 flex-wrap gap-2">' +
+    '<div class="text-sm text-gray-500">共 ' + list.length + ' 个 Skill · 可被数字员工引用复用</div>' +
+    '<button class="btn-primary !bg-accent hover:!bg-accent/90" onclick="openSkillModal()">+ 新建 Skill</button></div>';
   scopes.forEach(function (sc) {
     const items = list.filter(function (s) { return s.scope === sc; });
     html += '<div class="mb-6"><div class="flex items-center space-x-2 mb-3">' +
@@ -1153,12 +1727,128 @@ async function renderSkills(c) {
           '<div class="flex items-center justify-between mb-1.5"><span class="font-bold text-primary text-sm truncate">' + esc(s.name) + '</span>' +
           '<span class="badge badge-outline shrink-0 ml-1">' + esc(s.category || '-') + '</span></div>' +
           '<div class="text-xs text-gray-500 leading-relaxed" style="min-height:2.4em">' + esc(s.description || '') + '</div>' +
-          '<div class="text-xs text-gray-400 mt-2 pt-2 border-t border-gray-100">Owner：' + esc(s.owner_name || '-') + '</div></div>';
+          '<div class="flex items-center justify-between mt-2 pt-2 border-t border-gray-100">' +
+            '<span class="text-xs text-gray-400">Owner：' + esc(s.owner_name || '-') + '</span>' +
+            (canAdmin()
+              ? '<span class="flex space-x-1.5 shrink-0">' +
+                '<button class="btn-ghost !py-0.5 !px-2 !text-xs" onclick="openSkillEditModal(' + s.id + ')">编辑</button>' +
+                '<button class="btn-danger-sm !py-0.5 !px-2 !text-xs" onclick="openSkillDelete(' + s.id + ')">删除</button></span>'
+              : '') + '</div></div>';
       }).join('') + '</div>';
     }
     html += '</div>';
   });
+  /* R4-2：MCP 服务台账分区 */
+  html += '<div class="mb-2 mt-8 flex items-center justify-between flex-wrap gap-2">' +
+    '<div class="flex items-center space-x-2"><span class="badge bg-teal">MCP 服务</span>' +
+    '<span class="text-sm text-gray-500">数字员工可调用的外部系统接口台账，共 ' + mcpList.length + ' 个</span></div>' +
+    (canAdmin() ? '<button class="btn-primary" onclick="openMcpModal()">+ 新增 MCP</button>' : '') + '</div>';
+  if (!mcpList.length) html += '<div class="data-card">' + emptyHtml('暂无 MCP 服务，高管/教练团可点击右上角登记') + '</div>';
+  else {
+    html += '<div class="data-card !p-0 overflow-x-auto"><table class="gov-table w-full"><thead><tr>' +
+      '<th>名称</th><th>接入点</th><th>说明</th><th>状态</th>' + (canAdmin() ? '<th>操作</th>' : '') + '</tr></thead><tbody>' +
+      mcpList.map(function (m) {
+        return '<tr><td class="font-medium whitespace-nowrap">' + esc(m.name) + '</td>' +
+          '<td class="font-mono text-xs text-gray-500">' + esc(m.endpoint || '-') + '</td>' +
+          '<td class="text-xs text-gray-500 max-w-md">' + esc(m.description || '-') + '</td>' +
+          '<td>' + statusBadge(m.status, { '启用': 'bg-success', '停用': 'bg-gray-400' }) + '</td>' +
+          (canAdmin()
+            ? '<td class="whitespace-nowrap"><button class="btn-ghost !py-0.5 !px-2 !text-xs" onclick="toggleMcp(' + m.id + ',\'' + esc(m.status) + '\')">' +
+              (m.status === '启用' ? '停用' : '启用') + '</button></td>'
+            : '') + '</tr>';
+      }).join('') + '</tbody></table></div>';
+  }
   c.innerHTML = html;
+}
+/* Skill 新建 / 编辑弹窗（编辑仅 boss/coach 可见入口，后端同样鉴权） */
+function openSkillEditModal(id) {
+  const s = (cache.skills || []).find(function (x) { return x.id === id; });
+  if (!s) { toast('未找到该 Skill，请刷新后重试', 'error'); return; }
+  openSkillModal(s);
+}
+function openSkillModal(s) {
+  const editing = !!(s && s.id);
+  openModal('<h3 class="font-bold text-primary text-lg mb-4">' + (editing ? '编辑 Skill' : '新建 Skill') + '</h3>' +
+    '<div class="space-y-3">' +
+      '<div><label class="form-label">名称 *</label><input id="sk-name" class="form-input" placeholder="如：信用证审单" value="' + esc(editing ? s.name : '') + '"></div>' +
+      '<div class="grid grid-cols-2 gap-3">' +
+        '<div><label class="form-label">分类</label><input id="sk-category" class="form-input" placeholder="如：外贸" value="' + esc(editing ? (s.category || '') : '') + '"></div>' +
+        '<div><label class="form-label">范围</label><select id="sk-scope" class="form-select">' +
+          ['公开', '组织', '个人'].map(function (x) {
+            return '<option' + (editing && s.scope === x ? ' selected' : (!editing && x === '组织' ? ' selected' : '')) + '>' + x + '</option>';
+          }).join('') + '</select></div></div>' +
+      '<div><label class="form-label">说明</label><textarea id="sk-desc" class="form-textarea" rows="3" placeholder="这个 Skill 怎么用、适合什么场景">' + esc(editing ? (s.description || '') : '') + '</textarea></div>' +
+    '</div>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitSkill(' + (editing ? s.id : 0) + ')">' + (editing ? '保存修改' : '创建') + '</button></div>');
+}
+async function submitSkill(id) {
+  const body = {
+    name: document.getElementById('sk-name').value.trim(),
+    category: document.getElementById('sk-category').value.trim(),
+    scope: document.getElementById('sk-scope').value,
+    description: document.getElementById('sk-desc').value.trim(),
+  };
+  if (!body.name) { toast('请填写 Skill 名称', 'error'); return; }
+  try {
+    if (id) { await patchApi('/api/skills/' + id, body); toast('Skill 已更新'); }
+    else { await postApi('/api/skills', body); toast('Skill 已创建'); }
+    closeModal();
+    renderSkills(document.getElementById('view-container'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+function openSkillDelete(id) {
+  const s = (cache.skills || []).find(function (x) { return x.id === id; });
+  const name = s ? s.name : ('#' + id);
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">删除 Skill</h3>' +
+    '<p class="text-sm text-gray-600 mb-1">确定删除「<b>' + esc(name) + '</b>」吗？删除后数字员工技能标签中的同名标签不受影响，但无法再被新引用。</p>' +
+    '<p class="text-xs text-gray-400">该操作会写入审计日志。</p>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-danger-sm !px-5 !py-2" onclick="submitSkillDelete(' + id + ')">确认删除</button></div>');
+}
+async function submitSkillDelete(id) {
+  try {
+    await delApi('/api/skills/' + id);
+    closeModal();
+    toast('Skill 已删除');
+    renderSkills(document.getElementById('view-container'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+/* MCP 台账：新增 / 启停 */
+function openMcpModal() {
+  openModal('<h3 class="font-bold text-primary text-lg mb-4">新增 MCP 服务</h3>' +
+    '<div class="space-y-3">' +
+      '<div><label class="form-label">名称 *</label><input id="mc-name" class="form-input" placeholder="如：ERP只读接口"></div>' +
+      '<div><label class="form-label">接入点 *</label><input id="mc-endpoint" class="form-input font-mono" placeholder="如：mcp://erp.internal/read"></div>' +
+      '<div><label class="form-label">说明</label><textarea id="mc-desc" class="form-textarea" rows="2" placeholder="能提供什么数据/能力，有什么使用限制"></textarea></div>' +
+    '</div>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" onclick="submitMcp()">登记</button></div>');
+}
+async function submitMcp() {
+  const body = {
+    name: document.getElementById('mc-name').value.trim(),
+    endpoint: document.getElementById('mc-endpoint').value.trim(),
+    description: document.getElementById('mc-desc').value.trim(),
+  };
+  if (!body.name || !body.endpoint) { toast('请填写名称与接入点', 'error'); return; }
+  try {
+    await postApi('/api/mcp', body);
+    closeModal();
+    toast('MCP 服务已登记（默认停用，确认可用后再启用）');
+    renderSkills(document.getElementById('view-container'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+async function toggleMcp(id, current) {
+  const next = current === '启用' ? '停用' : '启用';
+  try {
+    await patchApi('/api/mcp/' + id, { status: next });
+    toast('已' + next + '该 MCP 服务');
+    renderSkills(document.getElementById('view-container'));
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 /* ==================== 视图 7：知识库 ==================== */
@@ -1180,9 +1870,11 @@ async function renderKnowledge(c) {
         '<div>所属：' + esc(s.dept_name || '-') + ' · 领域：' + esc(s.domain || '-') + '</div></div></div>';
   });
   html += '</div>';
-  html += '<div class="data-card"><div class="flex items-center justify-between mb-3">' +
+  html += '<div class="data-card"><div class="flex items-center justify-between mb-3 flex-wrap gap-2">' +
     '<h3 class="font-bold text-primary">空间文档</h3>' +
-    '<button class="btn-primary" onclick="openDocModal()">+ 登记文档</button></div>' +
+    '<div class="flex space-x-2">' +
+      (canUploadDoc() ? '<button class="btn-primary !bg-teal hover:!bg-teal/90" onclick="openUploadModal()">⇪ 上传文档</button>' : '') +
+      '<button class="btn-primary" onclick="openDocModal()">+ 登记文档</button></div></div>' +
     '<div id="docs-box">' + loadingHtml() + '</div></div>';
   c.innerHTML = html;
   await loadSpaceDocs();
@@ -1191,20 +1883,127 @@ async function selectSpace(id) {
   knState.spaceId = id;
   await renderKnowledge(document.getElementById('view-container'));
 }
+/* R4-3：转换产物格式徽章（md/sqlite/html 三色） */
+const DOC_FORMAT_META = {
+  md:     { cls: 'bg-success',   label: '.md' },
+  sqlite: { cls: 'bg-secondary', label: '.sqlite' },
+  html:   { cls: 'bg-accent',    label: '.html' },
+};
+function docFormatBadge(d) {
+  const m = DOC_FORMAT_META[d.converted_format];
+  if (!m) return '<span class="text-xs text-gray-300">—</span>';
+  return '<span class="badge ' + m.cls + '">' + m.label + '</span>';
+}
 async function loadSpaceDocs() {
   const box = document.getElementById('docs-box');
   if (!box) return;
   const docs = await api('/api/knowledge/documents?space_id=' + knState.spaceId);
-  if (!docs.length) { box.innerHTML = emptyHtml('这个资料柜还是空的，点右上角「登记文档」把公司文件放进来'); return; }
+  if (!docs.length) { box.innerHTML = emptyHtml('这个资料柜还是空的，点右上角「上传文档」或「登记文档」把公司文件放进来'); return; }
   box.innerHTML = '<div class="overflow-x-auto"><table class="gov-table w-full"><thead><tr>' +
-    '<th>标题</th><th>密级</th><th>标签</th><th>上传人</th><th>时间</th></tr></thead><tbody>' +
+    '<th>标题</th><th>密级</th><th>格式</th><th>块数</th><th>标签</th><th>上传人</th><th>时间</th></tr></thead><tbody>' +
     docs.map(function (d) {
-      return '<tr><td class="font-medium">' + esc(d.title) + '</td>' +
+      return '<tr class="cursor-pointer" onclick="openDocDetail(' + d.id + ')" title="点击查看解析详情">' +
+        '<td class="font-medium">' + esc(d.title) + '</td>' +
         '<td><span class="badge ' + (LEVEL_META[d.level] || 'bg-gray-400') + '">' + esc(d.level) + '</span></td>' +
+        '<td>' + docFormatBadge(d) + '</td>' +
+        '<td class="whitespace-nowrap">' + (d.chunk_count ? '<b class="text-secondary">' + d.chunk_count + '</b> 块' : '<span class="text-xs text-gray-300">—</span>') + '</td>' +
         '<td class="text-xs text-gray-500">' + esc(d.tags || '-') + '</td>' +
         '<td class="whitespace-nowrap">' + esc(d.uploaded_by || '-') + '</td>' +
         '<td class="whitespace-nowrap">' + fmtTime(d.created_at) + '</td></tr>';
     }).join('') + '</tbody></table></div>';
+}
+/* 上传文档：选文件 + 密级 + 标签，FormData 提交 */
+function openUploadModal() {
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">上传文档到本空间</h3>' +
+    '<p class="text-xs text-gray-500 mb-3">支持 txt / md / docx / pdf / csv / json / html，上传后自动转换并切块，供数字员工检索引用。</p>' +
+    '<div class="space-y-3">' +
+      '<div><label class="form-label">选择文件 *</label><input id="up-file" type="file" class="form-input !py-2" accept=".txt,.md,.docx,.pdf,.csv,.json,.html,.htm"></div>' +
+      '<div class="grid grid-cols-2 gap-3">' +
+        '<div><label class="form-label">密级</label><select id="up-level" class="form-select"><option>L1</option><option>L2</option><option selected>L3</option><option>L4</option></select></div>' +
+        '<div><label class="form-label">标签（逗号分隔）</label><input id="up-tags" class="form-input" placeholder="模板,单证"></div></div>' +
+    '</div>' +
+    '<div class="flex justify-end space-x-2 mt-4">' +
+      '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-primary" id="up-submit" onclick="submitUpload()">上传并解析</button></div>');
+}
+async function submitUpload() {
+  const fi = document.getElementById('up-file');
+  if (!fi.files || !fi.files.length) { toast('请先选择文件', 'error'); return; }
+  const fd = new FormData();
+  fd.append('file', fi.files[0]);
+  fd.append('level', document.getElementById('up-level').value);
+  fd.append('tags', document.getElementById('up-tags').value.trim());
+  const btn = document.getElementById('up-submit');
+  btn.disabled = true;
+  btn.textContent = '上传解析中…';
+  try {
+    const r = await uploadApi('/api/knowledge/spaces/' + knState.spaceId + '/upload', fd);
+    closeModal();
+    toast('上传成功：已转换为 .' + (r.converted_format || '?') + '，拆分 ' + (r.chunk_count ?? 0) + ' 块');
+    await renderKnowledge(document.getElementById('view-container'));
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '上传并解析';
+    toast(e.message, 'error');
+  }
+}
+/* 文档详情弹窗：summary + chunks 预览 + 下载转换产物 */
+async function openDocDetail(id) {
+  openModal(loadingHtml('加载文档解析…'));
+  try {
+    const d = await api('/api/knowledge/documents/' + id);
+    const chunks = d.chunks || [];
+    let html = '<div class="flex items-start justify-between mb-2"><h3 class="font-bold text-primary text-lg">' + esc(d.title) + '</h3>' +
+      '<span class="flex items-center gap-1.5 shrink-0">' + docFormatBadge(d) +
+      '<span class="badge ' + (LEVEL_META[d.level] || 'bg-gray-400') + '">' + esc(d.level) + '</span></span></div>' +
+      '<div class="text-xs text-gray-400 mb-3">' + esc(d.space_name || '') + ' · ' + esc(d.uploaded_by || '-') + ' · ' + fmtTime(d.created_at) +
+      (d.tags ? ' · 标签：' + esc(d.tags) : '') + '</div>';
+    if (d.summary) {
+      html += '<div class="mb-3"><div class="text-xs font-bold text-gray-500 mb-1">内容摘要</div>' +
+        '<div class="bg-gray-50 rounded-lg p-3 text-sm text-gray-700 leading-relaxed">' + esc(d.summary) + '</div></div>';
+    }
+    if (chunks.length) {
+      html += '<div class="mb-3"><div class="text-xs font-bold text-gray-500 mb-1.5">分块预览（' + chunks.length + ' 块）</div>' +
+        '<div class="space-y-2 max-h-64 overflow-y-auto pr-1">' + chunks.map(function (ck) {
+          return '<div class="border border-gray-100 rounded-lg p-2.5">' +
+            '<div class="flex items-center gap-2 text-xs mb-1"><span class="badge badge-outline">#' + ck.seq + '</span>' +
+            '<span class="font-bold text-secondary">' + esc(ck.heading || '（无标题）') + '</span></div>' +
+            '<div class="text-xs text-gray-500 leading-relaxed">' + esc((ck.content || '').slice(0, 150)) + ((ck.content || '').length > 150 ? '…' : '') + '</div></div>';
+        }).join('') + '</div></div>';
+    } else {
+      html += '<div class="text-xs text-gray-400 mb-3">本文档尚未解析分块（早期登记的文档仅作台账记录）。</div>';
+    }
+    html += '<div class="flex justify-end space-x-2 mt-2">' +
+      '<button class="btn-ghost" onclick="closeModal()">关闭</button>' +
+      (d.converted_format
+        ? '<button class="btn-primary" onclick="downloadDocFile(' + d.id + ',\'' + esc(d.converted_format) + '\')">下载转换产物</button>'
+        : '') + '</div>';
+    openModal(html);
+  } catch (e) { openModal(errorHtml(e.message)); }
+}
+/* 下载转换产物：接口需带 token，走 fetch→blob→本地下载 */
+async function downloadDocFile(id, format) {
+  const ext = { md: '.md', html: '.html', sqlite: '.db' }[format] || '.txt';
+  try {
+    const res = await fetch('/api/knowledge/documents/' + id + '/file', {
+      headers: state.token ? { 'Authorization': 'Bearer ' + state.token } : {},
+    });
+    if (!res.ok) {
+      let data = null;
+      try { data = await res.json(); } catch (e) { /* 非 JSON */ }
+      throw new Error((data && data.detail) || ('下载失败（HTTP ' + res.status + '）'));
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'document_' + id + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
+    toast('转换产物已开始下载');
+  } catch (e) { toast(e.message, 'error'); }
 }
 function openDocModal() {
   openModal('<h3 class="font-bold text-primary text-lg mb-4">登记文档</h3>' +

@@ -2,8 +2,9 @@
 
 - dispatch()：把人类需求派发给数字员工，生成任务与交付物，进入"待人工审核"
 - heartbeat()：项目管理智能体自动发日报 + 临期任务催办
-- 交付物默认由模板生成；若 settings 配置了 llm_base_url/llm_api_key/llm_model
-  三个键，则尝试调用 OpenAI 兼容接口，任何异常都回落到模板（默认不联网）
+- 交付物默认由模板生成；模型调用配置解析顺序：旧 settings llm_* 三键（向后兼容）
+  > agents.model_key 绑定的 model_providers > settings.default_model_key；
+  未配置 api_key 或调用异常都回落到模板（默认不联网）
 """
 import json
 import urllib.request
@@ -183,12 +184,27 @@ def _agent_actions(conn, agent_id):
     return []
 
 
-def _llm_deliverable(settings, agent, req, actions):
-    """若配置了 LLM 三要素则尝试调用 OpenAI 兼容接口；任何异常返回 None 回落模板"""
+def _resolve_llm(conn, settings, agent):
+    """解析本次生成应使用的 (base_url, api_key, model)；无可用配置返回 None。
+    优先级：旧 settings llm_* 三键（向后兼容）> agent.model_key 绑定 > settings.default_model_key。
+    provider 停用或未配置 api_key 时返回 None（回落模板，保持离线原则）。"""
     base, key, model = (settings.get("llm_base_url"), settings.get("llm_api_key"),
                         settings.get("llm_model"))
-    if not (base and key and model):
+    if base and key and model:
+        return base, key, model
+    mk = dict(agent).get("model_key") or settings.get("default_model_key") or "glm"
+    row = conn.execute("SELECT * FROM model_providers WHERE key=?", (mk,)).fetchone()
+    if not row or not row["enabled"] or not row["api_key"]:
         return None
+    return row["base_url"], row["api_key"], row["default_model"]
+
+
+def _llm_deliverable(conn, settings, agent, req, actions):
+    """按解析出的模型配置尝试调用 OpenAI 兼容接口；任何异常返回 None 回落模板"""
+    resolved = _resolve_llm(conn, settings, agent)
+    if not resolved:
+        return None
+    base, key, model = resolved
     try:
         prompt = (f"你是数字员工「{agent['name']}」，类别{agent['category']}。请根据需求生成 300-500 字"
                   f"中文 Markdown 交付物，结构化、可落地。\n需求：{req}\n场景动作：{actions}")
@@ -207,7 +223,7 @@ def _llm_deliverable(settings, agent, req, actions):
 def generate_deliverable(conn, agent, req):
     """生成交付物：优先 LLM（若配置），否则按类别模板"""
     actions = _agent_actions(conn, agent["id"])
-    text = _llm_deliverable(_get_settings(conn), agent, req, actions)
+    text = _llm_deliverable(conn, _get_settings(conn), agent, req, actions)
     if text:
         return text
     tpl = TEMPLATES.get(agent["category"], _tpl_general)

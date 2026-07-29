@@ -60,32 +60,32 @@ python -m uvicorn app.main:app --port 8000
 9. **治理中心**：激励申报（火花奖/银齿轮奖/金扳手奖/种子基金）、大模型 token 费用报销三级审批（平台长→数字化复核→财务）、全量审计留痕、六大红线公示。
 10. **项目流程**（V3 泳道图承载）：每个立项场景自动生成 N01–N40 五阶段流程（8 角色泳道矩阵），智能体自动推进 60% 节点，🤝节点 AI 起草人类确认，G1–G4 阶段门由决策层签核解锁，关键路径延迟自动预警。
 11. **路线图**：筑基/推广/深化三阶段 15 个里程碑与四波次（8-11 月）推进计划。
+12. **模型配置（R4）**：内置 GLM/Kimi/MiniMax/DeepSeek/通义千问五家 OpenAI 兼容模型，全局默认 + 单数字员工覆盖绑定，界面配置 Key 即用，未配置自动回落模板模拟。
+13. **Skill 维护与 Agent 自定义（R4）**：Skill 库支持增删改；数字员工可新建/改名/调部门，并绑定技能与 MCP 服务台账（ERP 只读/钉钉消息/NAS 检索）。
+14. **知识库上传解析（R4）**：txt/docx/pdf/csv/json/html 一键上传，按格式自动转换（文本→Markdown、表格→SQLite、网页→清洗 HTML）并拆分 chunk 生成摘要。
+15. **IM 绑定（R4）**：钉钉/飞书 OAuth 授权绑定，未配置凭证时提供演示模式一键模拟绑定。
+16. **执行链路可视化（R4）**：协作空间按"过去→现在→未来"聚合任务事件与项目流程后续节点，一览执行全貌。
 
 ## 四、接入真实大模型
 
-平台默认使用**模板模拟**生成交付物（不联网、零成本、可离线演示）。执行引擎在每次生成交付物时读取 `settings` 表，若以下三个键齐全，即自动切换为真实大模型调用（OpenAI 兼容接口）：
-
-| 键 | 说明 | 示例（智谱 GLM） |
-| -- | ---- | ---------------- |
-| `llm_base_url` | OpenAI 兼容接口地址（不含 /chat/completions） | `https://open.bigmodel.cn/api/paas/v4` |
-| `llm_api_key` | 接口密钥 | `你的 API Key` |
-| `llm_model` | 模型名 | `glm-4-flash` |
-
-配置方法（任选其一）：
+平台默认使用**模板模拟**生成交付物（不联网、零成本、可离线演示）。R4 起内置 5 家国内主流模型
+（智谱 GLM / Kimi / MiniMax / DeepSeek / 通义千问，均为 OpenAI 兼容接口），推荐直接调 API 配置：
 
 ```bash
-sqlite3 data/platform.db
+# 配置某家模型的 Key（boss/coach 身份）
+curl -X PUT http://localhost:8000/api/models/glm \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"api_key": "你的 API Key"}'
+# 切换全局默认模型
+curl -X PUT http://localhost:8000/api/models/default \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"key": "deepseek"}'
 ```
 
-```sql
-INSERT OR REPLACE INTO settings(key,value) VALUES('llm_base_url','https://open.bigmodel.cn/api/paas/v4');
-INSERT OR REPLACE INTO settings(key,value) VALUES('llm_api_key','你的 API Key');
-INSERT OR REPLACE INTO settings(key,value) VALUES('llm_model','glm-4-flash');
-```
-
-- 任何 OpenAI 兼容服务均可（智谱 GLM、DeepSeek、通义千问、Kimi 等），只改三个值即可。
-- **无需重启**：引擎每次生成时实时读取配置；调用超时或失败会静默回落到模板模拟，不会报错中断。
-- 删除这三个键（`DELETE FROM settings WHERE key LIKE 'llm_%';`）即恢复纯模板模拟。
+- **全局默认 + 单员覆盖**：`settings.default_model_key` 为全局默认；`PATCH /api/agents/{id} {"model_key":"kimi"}`
+  可让某个数字员工单独绑定模型（为空则跟随全局）。
+- **无需重启**：引擎每次生成时实时解析配置；Key 未配置、供应商停用、调用超时或失败都静默回落模板模拟。
+- **向后兼容**：旧的 `settings.llm_base_url / llm_api_key / llm_model` 三键仍然有效且优先级最高
+  （配置了三键则忽略 model_providers），删除即恢复按 model_providers 解析。
 
 ## 五、目录结构
 

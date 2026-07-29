@@ -248,10 +248,74 @@ CREATE TABLE IF NOT EXISTS gate_records (
     signed_at TEXT,
     comment TEXT
 );
+
+-- R4-1 模型供应商台账（OpenAI 兼容接口）
+CREATE TABLE IF NOT EXISTS model_providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT UNIQUE NOT NULL,          -- glm/kimi/minimax/deepseek/qwen
+    name TEXT NOT NULL,
+    base_url TEXT,
+    default_model TEXT,
+    api_key TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1
+);
+
+-- R4-2 MCP 服务台账（本迭代只做绑定与展示，不做真实调用）
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    endpoint TEXT,
+    description TEXT,
+    status TEXT DEFAULT '停用'         -- 启用/停用
+);
+
+-- R4-3 文档解析分块
+CREATE TABLE IF NOT EXISTS doc_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id),
+    seq INTEGER,
+    heading TEXT,
+    content TEXT
+);
+
+-- R4-4 第三方 IM 授权配置与人员绑定
+CREATE TABLE IF NOT EXISTS auth_providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT UNIQUE NOT NULL,     -- dingtalk/feishu
+    app_id TEXT DEFAULT '',
+    app_secret TEXT DEFAULT '',
+    redirect_uri TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS user_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL REFERENCES people(id),
+    provider TEXT NOT NULL,
+    external_id TEXT,
+    external_name TEXT,
+    bound_at TEXT,
+    UNIQUE(person_id, provider)
+);
 """
+
+# 老库增量迁移：逐条尝试，已存在则忽略（sqlite 不支持 IF NOT EXISTS 加列）
+MIGRATIONS = [
+    "ALTER TABLE agents ADD COLUMN model_key TEXT",             # R4-1 空=跟随全局默认
+    "ALTER TABLE agents ADD COLUMN mcp_ids TEXT DEFAULT '[]'",  # R4-2 MCP 绑定 JSON 数组
+    "ALTER TABLE documents ADD COLUMN file_path TEXT",          # R4-3 转换产物路径
+    "ALTER TABLE documents ADD COLUMN converted_format TEXT",   # R4-3 md/html/sqlite
+    "ALTER TABLE documents ADD COLUMN chunk_count INTEGER DEFAULT 0",
+    "ALTER TABLE documents ADD COLUMN summary TEXT",
+]
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表（幂等）"""
+    """建表 + 老库列迁移（均幂等）"""
     conn.executescript(DDL)
+    for sql in MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # 列已存在
     conn.commit()
