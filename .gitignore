@@ -16,6 +16,7 @@ multica-platform/data/*.log
 
 # 验收截图（报告 md 保留，图片不入库）
 agent-platform/acceptance/shots/
+agent-platform/acceptance/*.png
 agent-platform/acceptance/round*/*.png
 
 # 临时文件
