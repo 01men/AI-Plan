@@ -333,6 +333,28 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     fallback_reason TEXT,              -- 回落模板原因
     created_at TEXT
 );
+
+-- R6 默认制造业务展示数据：每次启动幂等补齐 DEMO-0001..DEMO-1000
+CREATE TABLE IF NOT EXISTS business_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_no TEXT UNIQUE NOT NULL,
+    business_type TEXT NOT NULL,        -- 销售订单/生产报工/质量检验/库存流水/售后工单
+    business_date TEXT NOT NULL,
+    department TEXT,
+    customer TEXT,
+    product_code TEXT,
+    product_name TEXT,
+    quantity INTEGER DEFAULT 0,
+    amount REAL DEFAULT 0,
+    status TEXT,
+    metric_name TEXT,
+    metric_value REAL DEFAULT 0,
+    detail TEXT DEFAULT '{}',           -- 各业务类型扩展字段 JSON
+    source TEXT DEFAULT '系统演示'
+);
+
+CREATE INDEX IF NOT EXISTS ix_business_records_type_date
+ON business_records(business_type, business_date);
 """
 
 # 老库增量迁移：逐条尝试，已存在则忽略（sqlite 不支持 IF NOT EXISTS 加列）

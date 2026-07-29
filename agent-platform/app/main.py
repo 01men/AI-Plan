@@ -14,9 +14,9 @@ from app.routers import (agents, auth, flows, governance, imbind, knowledge, mcp
                          metrics, models, org, roadmap, scenarios, skills, tasks,
                          workspaces)
 from app.routers.auth import audit, db_conn, get_current_person
-from app.seed import run_flow_seed, run_r4_seed, run_r5_seed, run_seed
+from app.seed import run_flow_seed, run_r4_seed, run_r5_seed, run_r6_seed, run_seed
 
-app = FastAPI(title="Agent 人机协作平台", version="1.5.0")
+app = FastAPI(title="Agent 人机协作平台", version="1.6.0")
 
 
 @app.exception_handler(RequestValidationError)
@@ -109,6 +109,7 @@ async def startup():
     run_flow_seed(conn)  # 流程引擎演示数据，settings.flow_seeded 标记，只跑一次
     run_r4_seed(conn)  # R4 增量种子（模型/MCP/IM 授权配置），settings.r4_seeded 标记
     run_r5_seed(conn)  # R5：按方案文档补齐 232 个场景容量位（幂等、不覆盖）
+    run_r6_seed(conn)  # R6：每次部署幂等补齐 1000 条制造业务展示数据
     crypto.migrate_credentials(conn)  # R5：明文凭证自动改写为 enc:v1 密文（幂等）
     conn.close()
     asyncio.create_task(_heartbeat_loop())

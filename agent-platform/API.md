@@ -198,19 +198,34 @@
 `payload.version` 为交付物版本号（首次派发=1，每次驳回重做 +1，重做时另有 `rework: true`）。
 
 ### POST /api/workspaces/{id}/messages
-发言。若 `zone=="agent"` 或内容含 `@某数字员工名` → 自动派发任务，数字员工产出交付物（见上例 28/29 两条消息）；agent 区无 @ 时派给工作区内全部数字员工成员。
+发言。R6 起 Agent 区支持两种明确模式：
+
+- `interaction_mode="chat"`：以所选数字员工身份调用真实模型连续回复；模型上下文包含数字员工职责、
+  本项目最近对话/任务/流程、当前人员有权读取的知识分块，以及默认制造业务数据。模型不可用时明确
+  返回原因，不用模板冒充回复；
+- `interaction_mode="task"`：正式派活，生成交付物并进入人工审核闭环（R1-R5 原行为）。
+
+`target_agent_id` 可指定本工作区数字员工；也可在内容中 `@数字员工名`。未传
+`interaction_mode` 时默认 `task`，保证旧客户端兼容。R6 前端在 Agent 协作区默认显式发送 `chat`。
 请求：
 ```json
-{"content": "@外贸跟单数字员工 请整理本周订单资料并生成唛头", "zone": "agent"}
+{"content": "结合订单与知识库规则继续深化交付风险方案", "zone": "agent",
+ "interaction_mode": "chat", "target_agent_id": 22}
 ```
 响应 200：
 ```json
 {
-  "message": {"id": 27, "sender_type": "human", "sender_name": "胡鑫", "zone": "agent", "msg_type": "text", "content": "@外贸跟单数字员工 请整理本周订单资料并生成唛头", "...": "..."},
-  "dispatched": [{"task_id": 6, "agent_id": 22, "agent_name": "外贸跟单数字员工"}]
+  "message": {"id": 27, "sender_type": "human", "sender_name": "胡鑫", "zone": "agent", "msg_type": "text", "...": "..."},
+  "interaction_mode": "chat",
+  "dispatched": [],
+  "replies": [{"message_id": 28, "agent_id": 22, "agent_name": "外贸跟单数字员工",
+               "model_info": {"provider": "qwen", "model": "qwen-turbo",
+                              "latency_ms": 1280, "ok": true, "reason": null}}]
 }
 ```
-未触发派发时 `dispatched` 为 `[]`。400 content 必填 / zone 非法；404 工作区不存在。
+聊天回复保存为普通 `agent/text` 消息，`payload.interaction_mode="chat"` 且携带脱敏
+`model_info`。正式派活响应仍使用 `dispatched[]`。400 content 必填 / zone 非法；
+422 模式非法、所选数字员工不是本工作区可用成员；404 工作区不存在。
 
 私聊区（第一轮验收新增）：`zone=="private"` 时不派活，由「项目管理智能体」生成一条需求打磨回复
 （把需求复述成结构化任务草稿 + 建议 @ 哪个数字员工 + 示例话术），响应多一个 `reply` 字段
@@ -620,6 +635,7 @@ multipart 文件上传（backbone/coach/boss/developer）。表单字段：`file
 | .docx | zipfile 解 word/document.xml 提取文本存 .md | md |
 | .pdf | 系统 pdftotext 提取存 .md（失败给中文 422） | md |
 | .csv/.json | 解析入 SQLite（`data/knowledge/doc_{id}.db` 的 data_rows 表）+ 生成 .md 摘要（列名+前 5 行） | sqlite |
+| .xlsx/.xls | 全部非空工作表分别写入 SQLite 表，保留数值/日期类型；逐表生成 UTF-8 CSV + .md 摘要 | sqlite+csv |
 | .html/.htm | 去 script/style 后存 .html | html |
 | 其他 | 422 中文错误 | - |
 
@@ -628,10 +644,26 @@ html 类按纯文本段落，表格类每 50 行一块），`documents.summary`=
 响应：文档对象（含 `file_path / converted_format / chunk_count / summary`）。
 
 #### GET /api/knowledge/documents/{id}
-文档详情 + `chunks[]`（`{id,seq,heading,content}`，按 seq 升序）+ `summary`。
+文档详情 + `chunks[]`（`{id,seq,heading,content}`，按 seq 升序）+ `summary`；
+表格文档另返回 `datasets[]`（工作表名、SQL 表名、行数、列数）。
 
 #### GET /api/knowledge/documents/{id}/file
 下载/预览转换产物（md→text/markdown，html→text/html）。404 无解析产物。
+
+#### GET /api/knowledge/documents/{id}/datasets/{table_name}
+预览解析后的 SQL 表。查询参数：`limit`（1-200，默认 50）、`offset`；响应
+`{table_name,columns,total,limit,offset,rows}`。
+
+#### GET /api/knowledge/documents/{id}/database
+下载该文档的 SQLite 数据库。
+
+#### GET /api/knowledge/documents/{id}/datasets/{table_name}/csv
+下载 Excel 某工作表对应的 UTF-8 CSV。
+
+#### GET /api/knowledge/business-data
+查询每次部署自动补齐的 1000 条制造业务展示数据。参数：`business_type`、`q`、`limit`、
+`offset`；响应含 `summary[]` 与分页 `items[]`。所有已登录员工可读，数字员工连续对话会
+自动召回与当前问题相关的明细。
 
 ### 13.4 钉钉/飞书绑定授权（R4-4）
 
@@ -708,7 +740,7 @@ html 类按纯文本段落，表格类每 50 行一块），`documents.summary`=
 ## 14. R5 终极优化新增契约
 
 ### GET /api/health
-免登录健康探针：`{"ok":true,"service":"rongqi-agent-platform","version":"1.5.0"}`。
+免登录健康探针：`{"ok":true,"service":"rongqi-agent-platform","version":"1.6.0"}`。
 
 ### GET /api/metrics/people
 人级 AI 成效（boss/coach/backbone）：人员、岗位、层级、部门、创建任务数、已通过数、

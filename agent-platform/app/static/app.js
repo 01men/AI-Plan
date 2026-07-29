@@ -29,7 +29,7 @@ const INCENTIVE_TIER_HINT = {
 const SCENARIO_STATUS_META = { '待立项': 'bg-gray-400', '已立项': 'bg-secondary', '开发中': 'bg-accent', '试点中': 'bg-teal', '已验收': 'bg-success', '已下线': 'bg-danger' };
 const ZONE_META = {
   discussion: { name: '讨论区',       desc: '和同事讨论，AI 不打扰', ph: '和同事聊聊想法……（AI 不会在这里插话）' },
-  agent:      { name: 'Agent 执行区', desc: '@数字员工 直接派活，它干完你检查', ph: '@数字员工 + 说人话描述任务，如：整理本周订单资料并生成唛头' },
+  agent:      { name: 'Agent 协作区', desc: '可连续对话深化项目，也可切换为正式派活并进入审核闭环', ph: '直接提问或继续追问，数字员工会结合项目、知识库和业务数据回答' },
   private:    { name: '私聊打磨区',   desc: '先和 AI 助手一对一理清需求（它只回建议不干活），想清楚了再去执行区派活', ph: '把想法说给 AI 助手听，它帮你理成任务草稿（不会派活）' },
 };
 const TASK_COLUMNS = ['待处理', '进行中', '待审核', '已通过', '已驳回'];
@@ -43,7 +43,7 @@ const state = {
   person: JSON.parse(localStorage.getItem('rq_person') || 'null'),
 };
 let charts = [];                    // ECharts 实例注册表，切换视图时统一 dispose
-const wsState = { id: null, zone: 'discussion', members: [] };  // 协作空间选中态
+const wsState = { id: null, zone: 'discussion', members: [], interactionMode: 'chat' };  // 协作空间选中态
 const govState = { tab: 'incentives' };                            // 治理中心 Tab
 const knState = { spaceId: null };                                 // 知识库展开的空间
 const cache = { agents: null, agentMap: {}, platforms: null };     // 简单缓存
@@ -861,6 +861,9 @@ async function loadWorkspacePanel() {
   if (!panel) return;
   const detail = await api('/api/workspaces/' + wsState.id);
   wsState.members = detail.members || [];
+  const availableAgents = wsState.members.filter(function (m) {
+    return m.member_type === 'agent' && m.status !== '已下线';
+  });
   const z = ZONE_META[wsState.zone];
   let html = '<div class="px-4 pt-3 border-b border-gray-100 shrink-0">' +
     '<div class="flex items-center justify-between mb-2">' +
@@ -880,7 +883,20 @@ async function loadWorkspacePanel() {
     /* 输入区 */
     '<div class="p-3 border-t border-gray-100 shrink-0 relative">' +
       '<div id="at-popup" class="at-popup hidden"></div>' +
-      '<div id="dispatch-hint" class="hidden text-xs text-accent font-medium mb-1.5">⚡ 将派发任务给数字员工执行</div>' +
+      (wsState.zone === 'agent'
+        ? '<div class="flex flex-wrap items-center gap-2 mb-2">' +
+          '<select id="ws-interaction-mode" class="form-select !w-44 !py-1.5 text-xs" onchange="switchAgentInteractionMode(this.value)">' +
+            '<option value="chat"' + (wsState.interactionMode === 'chat' ? ' selected' : '') + '>💬 连续对话深化</option>' +
+            '<option value="task"' + (wsState.interactionMode === 'task' ? ' selected' : '') + '>⚡ 正式派活交付</option></select>' +
+          '<select id="ws-target-agent" class="form-select !w-56 !py-1.5 text-xs">' +
+            availableAgents.map(function (m) {
+              return '<option value="' + m.member_id + '">' + esc(m.name) + ' · ' + esc(m.status || '可用') + '</option>';
+            }).join('') + '</select>' +
+          '<span id="interaction-help" class="text-[11px] text-gray-400">' +
+            (wsState.interactionMode === 'chat' ? '调用真实模型，自动携带历史与业务上下文' : '生成交付物并进入人工审核') +
+          '</span></div>'
+        : '') +
+      '<div id="dispatch-hint" class="hidden text-xs text-accent font-medium mb-1.5"></div>' +
       '<div class="flex items-end space-x-2">' +
         '<textarea id="ws-input" class="form-textarea flex-1" rows="2" placeholder="' + esc(z.ph || '输入消息，Enter 发送') + '"></textarea>' +
         '<button class="btn-primary shrink-0" onclick="sendWsMessage()">发送</button>' +
@@ -1001,10 +1017,19 @@ function messageHtml(m) {
   /* agent 消息（含私聊打磨稿、日报 report）：走 mdLite 渲染 markdown */
   const ag = cache.agentMap[m.sender_id] || {};
   const isReport = m.msg_type === 'report';
+  const modelInfo = (m.payload || {}).model_info;
+  let modelTrace = '';
+  if (modelInfo) {
+    modelTrace = modelInfo.ok
+      ? '<div class="text-[11px] text-teal mt-1">真实模型回复：' + esc(modelInfo.provider || '-') +
+        ' / ' + esc(modelInfo.model || '-') + ' · ' + (modelInfo.latency_ms || 0) + 'ms</div>'
+      : '<div class="text-[11px] text-danger mt-1">模型未完成：' + esc(modelInfo.reason || '未配置可用模型') + '</div>';
+  }
   return '<div class="flex my-2.5"><div class="msg-avatar bg-teal mr-2">' + ROBOT_SVG + '</div>' +
     '<div class="flex flex-col max-w-full"><div class="text-xs text-gray-400 mb-1">' + esc(m.sender_name) +
     (ag.dept_name ? ' · ' + esc(ag.dept_name) : '') + (isReport ? ' · 日报' : '') + ' · ' + t + '</div>' +
-    '<div class="msg-bubble msg-bubble-agent' + (isReport ? ' max-h-72 overflow-y-auto' : '') + '">' + mdLite(m.content) + '</div></div></div>';
+    '<div class="msg-bubble msg-bubble-agent' + (isReport ? ' max-h-72 overflow-y-auto' : '') + '">' + mdLite(m.content) + '</div>' +
+    modelTrace + '</div></div>';
 }
 function deliverableHtml(m, t) {
   const p = m.payload || {};
@@ -1089,24 +1114,56 @@ function updateDispatchHint() {
   if (!ta || !hint) return;
   const content = ta.value;
   const mention = wsState.members.some(function (x) { return x.member_type === 'agent' && content.indexOf('@' + x.name) >= 0; });
-  hint.classList.toggle('hidden', !(wsState.zone === 'agent' || mention));
+  const active = wsState.zone === 'agent' || mention;
+  const mode = (document.getElementById('ws-interaction-mode') || {}).value || 'task';
+  hint.textContent = mode === 'chat'
+    ? '💬 将调用所选数字员工的真实模型，结合本项目上下文连续回答'
+    : '⚡ 将派发正式任务，生成交付物并进入人工审核';
+  hint.classList.toggle('hidden', !active);
+}
+function switchAgentInteractionMode(mode) {
+  wsState.interactionMode = mode === 'task' ? 'task' : 'chat';
+  const help = document.getElementById('interaction-help');
+  if (help) help.textContent = wsState.interactionMode === 'chat'
+    ? '调用真实模型，自动携带历史与业务上下文'
+    : '生成交付物并进入人工审核';
+  const ta = document.getElementById('ws-input');
+  if (ta) ta.placeholder = wsState.interactionMode === 'chat'
+    ? '直接提问或继续追问，数字员工会结合项目、知识库和业务数据回答'
+    : '@数字员工 + 描述交付要求，如：整理本周订单并给出风险清单';
+  updateDispatchHint();
 }
 async function sendWsMessage() {
   const ta = document.getElementById('ws-input');
   const content = (ta.value || '').trim();
   if (!content) return;
   try {
-    const r = await postApi('/api/workspaces/' + wsState.id + '/messages', { content: content, zone: wsState.zone });
+    const modeEl = document.getElementById('ws-interaction-mode');
+    const targetEl = document.getElementById('ws-target-agent');
+    const body = { content: content, zone: wsState.zone };
+    if (wsState.zone === 'agent') {
+      body.interaction_mode = modeEl ? modeEl.value : wsState.interactionMode;
+      if (targetEl && targetEl.value) body.target_agent_id = Number(targetEl.value);
+    }
+    const r = await postApi('/api/workspaces/' + wsState.id + '/messages', body);
     ta.value = '';
     updateDispatchHint();
     const n = (r.dispatched || []).length;
     if (n) toast('已派发任务给：' + r.dispatched.map(function (d) { return d.agent_name; }).join('、'), 'info');
+    const replies = r.replies || [];
+    if (replies.length) {
+      const ok = replies.filter(function (x) { return x.model_info && x.model_info.ok; }).length;
+      toast(ok
+        ? replies.map(function (x) { return x.agent_name; }).join('、') + ' 已完成真实模型回复'
+        : '模型未完成回复，请查看对话中的原因', ok ? 'info' : 'error');
+    }
+    if (r.chat_error) toast(r.chat_error, 'error');
     /* R5 兜底：无可用数字员工时明确告知，需求已登记为待处理任务 */
     if (r.undispatched) {
       toast('数字员工暂时不可用，已登记待处理需求 #' + r.undispatched.pending_task_id +
         '，可在任务中心跟进', 'error');
     }
-    await loadMessages(n > 0 || !!r.undispatched);
+    await loadMessages(n > 0 || replies.length > 0 || !!r.undispatched);
   } catch (e) { toast(e.message, 'error'); }
 }
 /* 审核（协作空间内） */
@@ -1980,11 +2037,29 @@ async function toggleMcp(id, current) {
 /* ==================== 视图 7：知识库 ==================== */
 async function renderKnowledge(c) {
   c.innerHTML = loadingHtml('加载 NAS 空间…');
-  const spaces = await api('/api/knowledge/spaces');
+  const loaded = await Promise.all([
+    api('/api/knowledge/spaces'),
+    api('/api/knowledge/business-data?limit=8').catch(function () { return null; }),
+  ]);
+  const spaces = loaded[0];
+  const business = loaded[1];
   if (!knState.spaceId || !spaces.some(function (s) { return s.id === knState.spaceId; })) {
     knState.spaceId = spaces.length ? spaces[0].id : null;
   }
-  let html = '<div class="grid grid-cols-2 xl:grid-cols-3 gap-4 mb-5">';
+  let html = '';
+  if (business) {
+    const allCount = (business.summary || []).reduce(function (sum, item) { return sum + (item.count || 0); }, 0);
+    html += '<div class="data-card mb-5 bg-gradient-to-r from-secondary/5 to-teal/5">' +
+      '<div class="flex flex-wrap items-center justify-between gap-3 mb-3">' +
+        '<div><div class="font-bold text-primary">制造业务展示数据</div>' +
+        '<div class="text-xs text-gray-500 mt-0.5">每次部署自动补齐，可直接用于筛选、统计和数字员工连续问答</div></div>' +
+        '<div class="flex items-center gap-2"><span class="text-2xl font-black text-secondary">' + fmtNum(allCount) + '</span>' +
+        '<span class="text-xs text-gray-400">条</span><button class="btn-primary !py-1.5" onclick="openBusinessDataModal()">查看数据</button></div></div>' +
+      '<div class="flex flex-wrap gap-2">' + (business.summary || []).map(function (item) {
+        return '<span class="badge bg-teal">' + esc(item.business_type) + ' ' + item.count + ' 条</span>';
+      }).join('') + '</div></div>';
+  }
+  html += '<div class="grid grid-cols-2 xl:grid-cols-3 gap-4 mb-5">';
   spaces.forEach(function (s) {
     const active = s.id === knState.spaceId;
     html += '<div class="data-card card-hover cursor-pointer ' + (active ? 'ring-2 ring-secondary' : '') + '" onclick="selectSpace(' + s.id + ')">' +
@@ -2013,6 +2088,7 @@ async function selectSpace(id) {
 const DOC_FORMAT_META = {
   md:     { cls: 'bg-success',   label: '.md' },
   sqlite: { cls: 'bg-secondary', label: '.sqlite' },
+  'sqlite+csv': { cls: 'bg-secondary', label: 'SQLite + CSV' },
   html:   { cls: 'bg-accent',    label: '.html' },
 };
 function docFormatBadge(d) {
@@ -2041,9 +2117,9 @@ async function loadSpaceDocs() {
 /* 上传文档：选文件 + 密级 + 标签，FormData 提交 */
 function openUploadModal() {
   openModal('<h3 class="font-bold text-primary text-lg mb-1">上传文档到本空间</h3>' +
-    '<p class="text-xs text-gray-500 mb-3">支持 txt / md / docx / pdf / csv / json / html，上传后自动转换并切块，供数字员工检索引用。</p>' +
+    '<p class="text-xs text-gray-500 mb-3">支持 txt / md / docx / pdf / Excel / csv / json / html。Excel 会按工作表写入 SQLite，并逐表生成 CSV。</p>' +
     '<div class="space-y-3">' +
-      '<div><label class="form-label">选择文件 *</label><input id="up-file" type="file" class="form-input !py-2" accept=".txt,.md,.docx,.pdf,.csv,.json,.html,.htm"></div>' +
+      '<div><label class="form-label">选择文件 *</label><input id="up-file" type="file" class="form-input !py-2" accept=".txt,.md,.docx,.pdf,.xlsx,.xls,.csv,.json,.html,.htm"></div>' +
       '<div class="grid grid-cols-2 gap-3">' +
         '<div><label class="form-label">密级</label><select id="up-level" class="form-select"><option>L1</option><option>L2</option><option selected>L3</option><option>L4</option></select></div>' +
         '<div><label class="form-label">标签（逗号分隔）</label><input id="up-tags" class="form-input" placeholder="模板,单证"></div></div>' +
@@ -2065,7 +2141,7 @@ async function submitUpload() {
   try {
     const r = await uploadApi('/api/knowledge/spaces/' + knState.spaceId + '/upload', fd);
     closeModal();
-    toast('上传成功：已转换为 .' + (r.converted_format || '?') + '，拆分 ' + (r.chunk_count ?? 0) + ' 块');
+    toast('上传成功：已转换为 ' + (r.converted_format || '?') + '，拆分 ' + (r.chunk_count ?? 0) + ' 块');
     await renderKnowledge(document.getElementById('view-container'));
   } catch (e) {
     btn.disabled = false;
@@ -2099,6 +2175,22 @@ async function openDocDetail(id) {
     } else {
       html += '<div class="text-xs text-gray-400 mb-3">本文档尚未解析分块（早期登记的文档仅作台账记录）。</div>';
     }
+    const datasets = d.datasets || [];
+    if (datasets.length) {
+      html += '<div class="mb-3"><div class="flex items-center justify-between mb-1.5">' +
+        '<div class="text-xs font-bold text-gray-500">结构化数据表（' + datasets.length + '）</div>' +
+        '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="downloadDatasetDb(' + d.id + ')">下载 SQLite</button></div>' +
+        '<div class="space-y-1.5">' + datasets.map(function (ds) {
+          return '<div class="flex flex-wrap items-center gap-2 border border-gray-100 rounded-lg px-3 py-2 text-xs">' +
+            '<span class="font-bold text-secondary">' + esc(ds.sheet_name) + '</span>' +
+            '<code class="text-gray-400">' + esc(ds.table_name) + '</code>' +
+            '<span>' + ds.row_count + ' 行 × ' + ds.column_count + ' 列</span><span class="flex-1"></span>' +
+            '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="previewDocDataset(' + d.id + ',\'' + esc(ds.table_name) + '\')">预览</button>' +
+            (d.converted_format === 'sqlite+csv'
+              ? '<button class="btn-ghost !py-1 !px-2 text-xs" onclick="downloadDatasetCsv(' + d.id + ',\'' + esc(ds.table_name) + '\')">CSV</button>'
+              : '') + '</div>';
+        }).join('') + '</div></div>';
+    }
     html += '<div class="flex justify-end space-x-2 mt-2">' +
       '<button class="btn-ghost" onclick="closeModal()">关闭</button>' +
       (d.converted_format
@@ -2109,7 +2201,7 @@ async function openDocDetail(id) {
 }
 /* 下载转换产物：接口需带 token，走 fetch→blob→本地下载 */
 async function downloadDocFile(id, format) {
-  const ext = { md: '.md', html: '.html', sqlite: '.db' }[format] || '.txt';
+  const ext = { md: '.md', html: '.html', sqlite: '.md', 'sqlite+csv': '.md' }[format] || '.txt';
   try {
     const res = await fetch('/api/knowledge/documents/' + id + '/file', {
       headers: state.token ? { 'Authorization': 'Bearer ' + state.token } : {},
@@ -2130,6 +2222,71 @@ async function downloadDocFile(id, format) {
     setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
     toast('转换产物已开始下载');
   } catch (e) { toast(e.message, 'error'); }
+}
+async function downloadProtected(url, filename) {
+  const res = await fetch(url, {
+    headers: state.token ? { 'Authorization': 'Bearer ' + state.token } : {},
+  });
+  if (!res.ok) {
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* 非 JSON */ }
+    throw new Error((data && data.detail) || ('下载失败（HTTP ' + res.status + '）'));
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 3000);
+}
+async function downloadDatasetDb(id) {
+  try {
+    await downloadProtected('/api/knowledge/documents/' + id + '/database', 'document_' + id + '.db');
+    toast('SQLite 数据库已开始下载');
+  } catch (e) { toast(e.message, 'error'); }
+}
+async function downloadDatasetCsv(id, tableName) {
+  try {
+    await downloadProtected('/api/knowledge/documents/' + id + '/datasets/' + encodeURIComponent(tableName) + '/csv', tableName + '.csv');
+    toast('CSV 已开始下载');
+  } catch (e) { toast(e.message, 'error'); }
+}
+async function previewDocDataset(id, tableName) {
+  openModal(loadingHtml('加载数据表…'));
+  try {
+    const data = await api('/api/knowledge/documents/' + id + '/datasets/' + encodeURIComponent(tableName) + '?limit=30');
+    const columns = (data.columns || []).slice(0, 12);
+    openModal('<h3 class="font-bold text-primary text-lg mb-1">' + esc(tableName) + '</h3>' +
+      '<div class="text-xs text-gray-400 mb-3">共 ' + data.total + ' 行；当前预览前 ' + (data.rows || []).length +
+      ' 行、最多 12 列</div>' +
+      '<div class="overflow-auto max-h-[60vh]"><table class="gov-table w-full"><thead><tr>' +
+      columns.map(function (col) { return '<th class="whitespace-nowrap">' + esc(col) + '</th>'; }).join('') +
+      '</tr></thead><tbody>' + (data.rows || []).map(function (row) {
+        return '<tr>' + columns.map(function (col) {
+          return '<td class="whitespace-nowrap max-w-48 truncate" title="' + esc(row[col]) + '">' + esc(row[col]) + '</td>';
+        }).join('') + '</tr>';
+      }).join('') + '</tbody></table></div>' +
+      '<div class="flex justify-end mt-3"><button class="btn-ghost" onclick="closeModal()">关闭</button></div>');
+  } catch (e) { openModal(errorHtml(e.message)); }
+}
+async function openBusinessDataModal() {
+  openModal(loadingHtml('加载 1000 条业务展示数据…'));
+  try {
+    const data = await api('/api/knowledge/business-data?limit=50');
+    const rows = data.items || [];
+    openModal('<div class="flex items-start justify-between mb-3"><div><h3 class="font-bold text-primary text-lg">制造业务展示数据</h3>' +
+      '<div class="text-xs text-gray-400">系统默认共 ' + data.total + ' 条，数字员工对话会自动召回相关明细</div></div>' +
+      '<button class="text-gray-400 text-xl" onclick="closeModal()">×</button></div>' +
+      '<div class="overflow-auto max-h-[65vh]"><table class="gov-table w-full"><thead><tr>' +
+      '<th>编号</th><th>日期</th><th>类型</th><th>客户</th><th>产品</th><th>数量</th><th>金额</th><th>状态</th><th>指标</th>' +
+      '</tr></thead><tbody>' + rows.map(function (r) {
+        return '<tr><td class="font-mono whitespace-nowrap">' + esc(r.record_no) + '</td>' +
+          '<td class="whitespace-nowrap">' + esc(r.business_date) + '</td><td>' + esc(r.business_type) + '</td>' +
+          '<td class="whitespace-nowrap">' + esc(r.customer) + '</td><td class="whitespace-nowrap">' + esc(r.product_code) + ' ' + esc(r.product_name) + '</td>' +
+          '<td>' + fmtNum(r.quantity) + '</td><td>¥' + fmtNum(r.amount) + '</td><td class="whitespace-nowrap">' + esc(r.status) + '</td>' +
+          '<td class="whitespace-nowrap">' + esc(r.metric_name) + ' ' + esc(r.metric_value) + '</td></tr>';
+      }).join('') + '</tbody></table></div>' +
+      '<div class="text-xs text-gray-400 mt-2">当前展示最近 50 条；API 支持按业务类型、关键词和分页查询。</div>');
+  } catch (e) { openModal(errorHtml(e.message)); }
 }
 function openDocModal() {
   openModal('<h3 class="font-bold text-primary text-lg mb-4">登记文档</h3>' +

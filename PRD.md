@@ -6,7 +6,7 @@
 - 仓库：https://github.com/01men/AI-Plan （main 分支）
 - 平台代码：`agent-platform/`（Kimi 维护）；Multica 融合：`multica-platform/`（GPT 维护）
 - 运行：双击 `agent-platform/启动平台.bat` → http://127.0.0.1:8000（FastAPI + SQLite + 原生 SPA）
-- 最近更新：2026-07-29（GPT，R5 交付终验）
+- 最近更新：2026-07-29（GPT，R6 验收阻断项修复）
 
 ---
 
@@ -57,6 +57,15 @@
 | R5-8 | 离线可运行：Tailwind/ECharts/二维码脚本本地化，一键启动自动校验依赖 | ✅ |
 | R5-9 | 自动化与角色验收：平台 18/18、运行态 21/21、Multica bridge 5/5、浏览器无 JS 错误 | ✅ |
 
+### 验收阻断项修复（R6 · 2026-07-29）
+
+| # | 能力 | 验收标准 | 状态 |
+|---|---|---|---|
+| R6-1 | 数字员工连续模型对话 | Agent 协作区默认“连续对话深化”；以员工身份回复，携带历史对话、项目任务/流程、授权知识与业务数据；可切换正式派活 | ✅ |
+| R6-2 | Excel 知识解析 | `.xlsx/.xls` 全部非空工作表分别入 SQLite，数值/日期类型可用；逐表生成 CSV、摘要与 chunk，可在界面预览/下载 | ✅ |
+| R6-3 | 默认业务展示数据 | 全新部署必有 1000 条制造业务数据；每次启动幂等检查、缺失自动补回；普通员工可见，数字员工可召回 | ✅ |
+| R6-4 | 回归保障 | R1-R5 未传交互模式的 API 继续默认正式派活；新增三类阻断项自动化测试 | ✅ |
+
 ### 后续候选（Backlog，认领制）
 
 | # | 需求 | 优先级 | 来源 |
@@ -72,7 +81,7 @@
 
 1. **模型配置**：表 `model_providers(key, name, base_url, default_model, api_key, enabled)`，内置 GLM/Kimi/MiniMax/DeepSeek/通义千问；`agents.model_key` 为空时跟随全局默认。R5 起异常回落模板但必须在任务和调用记录中明确留痕。
 2. **MCP**：表 `mcp_servers(id,name,endpoint,description,status)`，agents 侧 JSON 数组绑定；本迭代只做台账绑定与展示，不做真实 MCP 调用。
-3. **知识上传**：`POST /api/knowledge/spaces/{id}/upload`（multipart）；转换：txt/md/docx/pdf→.md（pdf 走系统 pdftotext，docx 走 zipfile+XML 提取），csv/json→SQLite（`data/knowledge/`），html/htm→清洗后 .html；产物存 `data/uploads/`；`doc_chunks` 表按标题/段落拆分（≈500 字/块）+ 摘要。
+3. **知识上传**：`POST /api/knowledge/spaces/{id}/upload`（multipart）；转换：txt/md/docx/pdf→.md，csv/json→SQLite，xlsx/xls→多表 SQLite + 逐表 CSV，html/htm→清洗后 .html；产物存 `data/uploads/` 与 `data/knowledge/`；`doc_chunks` 按文本段落或表格每 50 行拆分。
 4. **IM 绑定**：`auth_providers` + `user_bindings` 表；授权 URL 按钉钉/飞书标准 OAuth 拼接；R5 起二维码由同源后端生成，一次性 state/短码换会话；Secret 加密落库且不出现在日志和接口响应中。
 5. **场景推荐分**：`score = 优先级权重(高3/中2/低1) + 预期收益归一化 + 首批试点加成(2)`，降序排列。
 6. **执行链路**：`GET /api/workspaces/{id}/chain` 聚合消息/任务历史与 project_flows 后续节点；前端横向链路条（✅完成/🔵进行中/⚪未来），CSS 连线。
@@ -84,3 +93,4 @@
 - 2026-07-20 Kimi：项目流程引擎（V3 泳道 N01-N40 + G1-G4）
 - 2026-07-20 Kimi：R4 六项迭代启动（本 PRD 建档）
 - 2026-07-29 GPT：R5 终极优化、真实配置联调、三角色浏览器终验与干净交付库完成
+- 2026-07-29 GPT：R6 修复数字员工无法连续模型互动、Excel 无法解析、部署无 1000 条展示业务数据三项客户验收阻断问题

@@ -594,6 +594,74 @@ def run_r5_seed(conn) -> bool:
     return True
 
 
+def run_r6_seed(conn) -> int:
+    """每次启动幂等补齐 1000 条制造企业展示数据。
+
+    使用固定业务编号与随机种子，保证全新部署必有 DEMO-0001..DEMO-1000；
+    老库缺失任意编号时自动补回，但不覆盖用户对既有样例的修改。
+    """
+    rng = random.Random(20260729)
+    today = datetime.now().date()
+    products = [
+        ("PT-1250", "125mm角磨机"), ("DR-650", "650W冲击钻"),
+        ("SA-1800", "多功能料理机"), ("BL-520", "无刷电钻"),
+        ("JS-750", "曲线锯"),
+    ]
+    customers = ["德国汉萨", "波兰北星", "浙江宏拓", "广东力创", "江苏恒工", "线上旗舰店"]
+    type_rules = [
+        ("销售订单", "国际销售部", ["待确认", "生产中", "待发货", "已完成"]),
+        ("生产报工", "生产部", ["计划中", "生产中", "已完工", "异常待处理"]),
+        ("质量检验", "品管部", ["合格", "合格", "合格", "待复检", "不合格"]),
+        ("库存流水", "生管部", ["已入库", "已出库", "待盘点", "库存预警"]),
+        ("售后工单", "品保部", ["待受理", "分析中", "待回访", "已关闭"]),
+    ]
+    rows = []
+    for index in range(1, 1001):
+        business_type, department, statuses = type_rules[(index - 1) % len(type_rules)]
+        product_code, product_name = products[(index * 7) % len(products)]
+        quantity = rng.randint(1, 240)
+        unit_price = rng.choice([268.0, 399.0, 528.0, 699.0, 899.0])
+        business_date = (today - timedelta(days=rng.randint(0, 179))).isoformat()
+        status = statuses[rng.randrange(len(statuses))]
+        customer = customers[rng.randrange(len(customers))]
+        metric_name, metric_value = {
+            "销售订单": ("准交率", round(rng.uniform(88, 100), 1)),
+            "生产报工": ("计划达成率", round(rng.uniform(82, 100), 1)),
+            "质量检验": ("一次合格率", round(rng.uniform(91, 100), 1)),
+            "库存流水": ("库存周转天数", round(rng.uniform(18, 65), 1)),
+            "售后工单": ("关闭时长小时", round(rng.uniform(2, 72), 1)),
+        }[business_type]
+        detail = {
+            "batch_no": f"B{business_date.replace('-', '')}-{(index % 30) + 1:02d}",
+            "line": f"{(index % 6) + 1}号线",
+            "warehouse": f"{chr(65 + index % 4)}库",
+            "owner": PEOPLE[(index * 3) % len(PEOPLE)][0],
+            "remark": f"{business_type}系统展示样例，可用于筛选、统计和数字员工问答",
+        }
+        rows.append((
+            f"DEMO-{index:04d}", business_type, business_date, department, customer,
+            product_code, product_name, quantity, round(quantity * unit_price, 2),
+            status, metric_name, metric_value, J(detail), "系统演示",
+        ))
+    before = conn.total_changes
+    conn.executemany(
+        "INSERT OR IGNORE INTO business_records("
+        "record_no,business_type,business_date,department,customer,product_code,"
+        "product_name,quantity,amount,status,metric_name,metric_value,detail,source)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    inserted = conn.total_changes - before
+    if inserted:
+        conn.execute(
+            "INSERT INTO audits(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)",
+            ("系统", "R6 业务数据补齐", "business_records",
+             f"补齐 {inserted} 条，默认展示数据总量 1000 条", _now()),
+        )
+    conn.commit()
+    return inserted
+
+
 # ---------------- 项目流程引擎演示数据（新老库通用，settings.flow_seeded 标记） ----------------
 
 def _fts(days_ago, hour=9, minute=0):

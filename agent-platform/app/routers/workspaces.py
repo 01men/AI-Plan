@@ -29,8 +29,13 @@ def _members(conn, wid):
         if m["member_type"] == "human":
             r = conn.execute("SELECT name FROM people WHERE id=?", (m["member_id"],)).fetchone()
         else:
-            r = conn.execute("SELECT name FROM agents WHERE id=?", (m["member_id"],)).fetchone()
+            r = conn.execute(
+                "SELECT name,status,model_key FROM agents WHERE id=?", (m["member_id"],)
+            ).fetchone()
         d["name"] = r["name"] if r else f"{m['member_type']}#{m['member_id']}"
+        if r and m["member_type"] == "agent":
+            d["status"] = r["status"]
+            d["model_key"] = r["model_key"]
         out.append(d)
     return out
 
@@ -125,10 +130,12 @@ def list_messages(wid: int, zone: str = None, limit: int = 200, conn=Depends(db_
     return [_msg_view(r) for r in conn.execute(sql, args)]
 
 
-def _find_mentioned_agents(conn, content):
-    """从消息内容中识别 @数字员工（按名称最长匹配优先）"""
+def _find_mentioned_agents(conn, wid, content):
+    """从消息内容中识别本工作区 @数字员工（按名称最长匹配优先）"""
     agents = conn.execute(
-        "SELECT id,name FROM agents WHERE status NOT IN ('已下线') ORDER BY LENGTH(name) DESC").fetchall()
+        "SELECT a.id,a.name FROM workspace_members wm JOIN agents a ON a.id=wm.member_id "
+        "WHERE wm.workspace_id=? AND wm.member_type='agent' AND a.status NOT IN ('已下线') "
+        "ORDER BY LENGTH(a.name) DESC", (wid,)).fetchall()
     hits, seen = [], set()
     for a in agents:
         if f"@{a['name']}" in content and a["id"] not in seen:
@@ -140,7 +147,7 @@ def _find_mentioned_agents(conn, content):
 @router.post("/{wid}/messages")
 def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
                  person=Depends(get_current_person)):
-    """发言；zone=='agent' 或内容 @数字员工 时触发数字员工执行"""
+    """发言；Agent 区支持 chat（连续模型对话）与 task（正式派活）两种模式。"""
     ws = conn.execute("SELECT * FROM workspaces WHERE id=?", (wid,)).fetchone()
     if not ws:
         raise HTTPException(404, "工作区不存在")
@@ -151,6 +158,11 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
         raise HTTPException(400, "content 必填")
     if zone not in ("discussion", "agent", "private"):
         raise HTTPException(400, "zone 仅支持 discussion/agent/private")
+    interaction_mode = body.get("interaction_mode")
+    if interaction_mode is None:
+        interaction_mode = "task"  # 兼容 R1-R5 客户端；R6 前端会显式传 chat
+    if interaction_mode not in ("chat", "task"):
+        raise HTTPException(422, "interaction_mode 仅支持 chat/task")
 
     msg_id = conn.execute(
         "INSERT INTO messages(workspace_id,sender_type,sender_id,sender_name,zone,msg_type,content,created_at)"
@@ -171,25 +183,59 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
                                                    (reply_id,)).fetchone())
         return resp
 
-    # 触发数字员工：显式 @ 优先；agent 区无 @ 时派给工作区内全部数字员工成员
-    targets = _find_mentioned_agents(conn, content)
+    # 触发数字员工：显式 @ / target_agent_id 优先；否则沿用本区可用数字员工
+    targets = _find_mentioned_agents(conn, wid, content)
+    target_agent_id = body.get("target_agent_id")
+    if target_agent_id and not targets:
+        target = conn.execute(
+            "SELECT a.id,a.name FROM workspace_members wm JOIN agents a ON a.id=wm.member_id "
+            "WHERE wm.workspace_id=? AND wm.member_type='agent' AND a.id=? "
+            "AND a.status NOT IN ('已下线')", (wid, target_agent_id)
+        ).fetchone()
+        if not target:
+            raise HTTPException(422, "所选数字员工不是本工作区可用成员")
+        targets = [target]
     if zone == "agent" and not targets:
         targets = [dict(r) for r in conn.execute(
             "SELECT a.id, a.name FROM workspace_members wm JOIN agents a ON a.id=wm.member_id "
             "WHERE wm.workspace_id=? AND wm.member_type='agent' AND a.status NOT IN ('已下线')", (wid,))]
-    dispatched = []
-    for a in targets:
-        task_id = engine.dispatch(conn, wid, a["id"], person["name"], content,
-                                  creator_id=person["id"])
-        if task_id:
-            dispatched.append({"task_id": task_id, "agent_id": a["id"], "agent_name": a["name"]})
+    dispatched, replies = [], []
+    if interaction_mode == "chat":
+        if not targets:
+            message = (
+                "当前工作区没有可用的数字员工，无法发起真实模型对话。"
+                "请联系项目负责人将已启用的数字员工加入本工作区。"
+            )
+            engine._add_message(
+                conn, wid, "system", None, "系统", "agent", "text", message,
+                {"interaction_mode": "chat", "model_info": {
+                    "ok": False, "reason": "工作区无可用数字员工",
+                }},
+            )
+        else:
+            for a in targets:
+                reply = engine.chat_with_agent(conn, wid, a["id"], person, content)
+                if reply:
+                    replies.append(reply)
+        conn.commit()
+    else:
+        for a in targets:
+            task_id = engine.dispatch(conn, wid, a["id"], person["name"], content,
+                                      creator_id=person["id"])
+            if task_id:
+                dispatched.append({"task_id": task_id, "agent_id": a["id"], "agent_name": a["name"]})
     if dispatched:
         audit(conn, person["name"], "派发任务", f"工作区#{wid}",
               f"派发 {len(dispatched)} 个任务：" + ",".join(str(t["task_id"]) for t in dispatched))
+    if replies:
+        audit(conn, person["name"], "数字员工模型对话", f"工作区#{wid}",
+              "、".join(r["agent_name"] for r in replies))
     resp = {"message": _msg_view(conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()),
-            "dispatched": dispatched}
+            "interaction_mode": interaction_mode, "dispatched": dispatched, "replies": replies}
+    if zone == "agent" and interaction_mode == "chat" and not targets:
+        resp["chat_error"] = "工作区无可用数字员工"
     # R5 兜底：agent 区发言未派发成功时，不静默成功——说明原因、推荐在线员工、登记待处理需求
-    if zone == "agent" and not dispatched:
+    if zone == "agent" and interaction_mode == "task" and not dispatched:
         resp["undispatched"] = engine.handle_undispatched(conn, wid, person, content)
         conn.commit()
         audit(conn, person["name"], "派活兜底登记", f"工作区#{wid}",

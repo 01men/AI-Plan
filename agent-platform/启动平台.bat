@@ -8,7 +8,7 @@ echo   金华聚杰电器 AI 数智化行动方案支撑底座
 echo ============================================
 echo.
 echo  正在检查运行依赖...
-python -c "import fastapi,uvicorn,cryptography,qrcode,multipart" >nul 2>&1
+python -c "import fastapi,uvicorn,cryptography,qrcode,multipart,openpyxl,xlrd" >nul 2>&1
 if errorlevel 1 (
   echo  首次运行正在安装依赖，请保持网络畅通...
   python -m pip install -r requirements.txt
