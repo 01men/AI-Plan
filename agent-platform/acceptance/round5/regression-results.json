@@ -1,0 +1,208 @@
+{
+  "summary": {
+    "total": 33,
+    "passed": 33,
+    "failed": 0,
+    "failures": []
+  },
+  "results": [
+    {
+      "role": "董事长",
+      "item": "首年投入 34.29 万口径",
+      "ok": true,
+      "evidence": "342895.6"
+    },
+    {
+      "role": "董事长",
+      "item": "ROI 首年 57.5%",
+      "ok": true,
+      "evidence": "57.5"
+    },
+    {
+      "role": "董事长",
+      "item": "KPI 八项齐全",
+      "ok": true,
+      "evidence": "['coverage', 'trial_coverage', 'acceptance_rate', 'active_rate', 'hours_saved', 'accuracy', 'annual_benefit', 'reuse_count']"
+    },
+    {
+      "role": "董事长",
+      "item": "项目流程列表可读",
+      "ok": true,
+      "evidence": "7 个流程"
+    },
+    {
+      "role": "董事长",
+      "item": "阶段门签核（无待签核门，跳过）",
+      "ok": true,
+      "evidence": "全部门禁已处理"
+    },
+    {
+      "role": "师圆圆",
+      "item": "敏捷申报场景",
+      "ok": true,
+      "evidence": "84"
+    },
+    {
+      "role": "师圆圆",
+      "item": "一键立项自动建工作区",
+      "ok": true,
+      "evidence": "ws#13"
+    },
+    {
+      "role": "师圆圆",
+      "item": "激励档位校验(3000超档拦截)",
+      "ok": true,
+      "evidence": "火花奖申报金额须在 500-2000 元之间，当前 3000 元超出档位"
+    },
+    {
+      "role": "师圆圆",
+      "item": "激励申报(800元合规)",
+      "ok": true,
+      "evidence": "6"
+    },
+    {
+      "role": "戴栓",
+      "item": "组织树 5 平台 28 部门",
+      "ok": true,
+      "evidence": "5平台/28部门"
+    },
+    {
+      "role": "戴栓",
+      "item": "覆盖率双口径",
+      "ok": true,
+      "evidence": "coverage=0.0/trial=6.0"
+    },
+    {
+      "role": "胡鑫",
+      "item": "讨论区发言",
+      "ok": true,
+      "evidence": "200"
+    },
+    {
+      "role": "胡鑫",
+      "item": "私聊区需求打磨回复",
+      "ok": true,
+      "evidence": "项目管理智能体"
+    },
+    {
+      "role": "胡鑫",
+      "item": "agent区@派活或明确兜底",
+      "ok": true,
+      "evidence": "本工作区的数字员工（外贸跟单数字员工）已下线，暂时无法承接新任务，可联系负责人（谢荣浩）或改派其他在线员工。"
+    },
+    {
+      "role": "胡鑫",
+      "item": "开发者无权审核(403)",
+      "ok": true,
+      "evidence": "当前身份无权审核任务，仅高管/教练团/骨干可审核"
+    },
+    {
+      "role": "徐露璐",
+      "item": "只见本人工作区",
+      "ok": true,
+      "evidence": "[2]"
+    },
+    {
+      "role": "徐露璐",
+      "item": "越权读他人工作区被拦截",
+      "ok": true,
+      "evidence": "工作区不存在或无权访问"
+    },
+    {
+      "role": "徐露璐",
+      "item": "agent区发言有明确结果(兜底登记)",
+      "ok": true,
+      "evidence": "本工作区的数字员工（外贸跟单数字员工）已下线，暂时无法承接新任务，可联系负责人（谢荣浩）或改派其他在线员工。"
+    },
+    {
+      "role": "徐露璐",
+      "item": "待处理需求可在任务中心查到",
+      "ok": true,
+      "evidence": "[待派活] 请帮我整理本周售后维修记录"
+    },
+    {
+      "role": "徐露璐",
+      "item": "一线员工无权审核(403)",
+      "ok": true,
+      "evidence": "当前身份无权审核任务，仅高管/教练团/骨干可审核"
+    },
+    {
+      "role": "杨思严",
+      "item": "投入三科目口径",
+      "ok": true,
+      "evidence": "{'算力资源': 137895.6, 'NAS知识库底座': 105000.0, '创新激励奖金池': 100000.0}"
+    },
+    {
+      "role": "杨思严",
+      "item": "报销单创建",
+      "ok": true,
+      "evidence": "待平台长审批"
+    },
+    {
+      "role": "杨思严",
+      "item": "第1级平台长审批",
+      "ok": true,
+      "evidence": "待数字化复核"
+    },
+    {
+      "role": "杨思严",
+      "item": "第2级数字化复核(仅coach)",
+      "ok": true,
+      "evidence": "待财务报销"
+    },
+    {
+      "role": "杨思严",
+      "item": "第3级财务报销(财务部)",
+      "ok": true,
+      "evidence": "已完成"
+    },
+    {
+      "role": "杨思严",
+      "item": "审计留痕可按动作筛选",
+      "ok": true,
+      "evidence": "3 条"
+    },
+    {
+      "role": "李丹",
+      "item": "人才梯队五层呈现",
+      "ok": true,
+      "evidence": "['backbone', 'boss', 'coach', 'developer', 'staff']"
+    },
+    {
+      "role": "李丹",
+      "item": "银齿轮奖档位下限校验",
+      "ok": true,
+      "evidence": "银齿轮奖申报金额须在 5000-10000 元之间，当前 400 元超出档位"
+    },
+    {
+      "role": "李丹",
+      "item": "人级/员工级考核数据可得",
+      "ok": true,
+      "evidence": "65 个数字员工指标"
+    },
+    {
+      "role": "范丁鑫",
+      "item": "六大红线公示",
+      "ok": true,
+      "evidence": "6"
+    },
+    {
+      "role": "范丁鑫",
+      "item": "知识库密级分级",
+      "ok": true,
+      "evidence": "['L1', 'L2']"
+    },
+    {
+      "role": "范丁鑫",
+      "item": "422 错误中文化",
+      "ok": true,
+      "evidence": "name 与 dept_id 必填"
+    },
+    {
+      "role": "范丁鑫",
+      "item": "非成员工作区访问被拦截",
+      "ok": true,
+      "evidence": "工作区不存在或无权访问"
+    }
+  ]
+}

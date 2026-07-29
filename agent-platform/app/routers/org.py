@@ -6,9 +6,11 @@ from app.routers.auth import db_conn, get_current_person, person_view
 router = APIRouter(prefix="/api", tags=["org"])
 
 
-@router.get("/org/tree", dependencies=[Depends(get_current_person)])
-def org_tree(conn=Depends(db_conn)):
+@router.get("/org/tree")
+def org_tree(conn=Depends(db_conn), person=Depends(get_current_person)):
     """5 平台嵌套部门，部门含 people[] 与 agents[]（基本信息）"""
+    if person["tier"] == "staff":
+        raise HTTPException(403, "普通员工无需访问完整组织配置")
     platforms = [dict(r) for r in conn.execute("SELECT * FROM platforms ORDER BY id")]
     depts = [dict(r) for r in conn.execute("SELECT * FROM departments ORDER BY id")]
     people = [dict(r) for r in conn.execute(
@@ -24,7 +26,8 @@ def org_tree(conn=Depends(db_conn)):
 
 
 @router.get("/people")
-def list_people(tier: str = None, dept_id: int = None, conn=Depends(db_conn)):
+def list_people(tier: str = None, dept_id: int = None, conn=Depends(db_conn),
+                person=Depends(get_current_person)):
     sql = ("SELECT p.*, d.name dept_name FROM people p JOIN departments d ON d.id=p.dept_id")
     cond, args = [], []
     if tier:
@@ -39,8 +42,18 @@ def list_people(tier: str = None, dept_id: int = None, conn=Depends(db_conn)):
     return [dict(r) for r in conn.execute(sql, args)]
 
 
-@router.get("/people/{pid}", dependencies=[Depends(get_current_person)])
-def get_person(pid: int, conn=Depends(db_conn)):
+@router.get("/login/people")
+def login_people(conn=Depends(db_conn)):
+    """演示登录选择器：只公开在职人员的必要展示字段。"""
+    return [person_view(conn, r) for r in conn.execute(
+        "SELECT id,dept_id,name,role_title,tier,direction,status FROM people "
+        "WHERE status='在职' ORDER BY id")]
+
+
+@router.get("/people/{pid}")
+def get_person(pid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
+    if person["tier"] == "staff" and person["id"] != pid:
+        raise HTTPException(403, "普通员工只能查看本人档案")
     row = conn.execute("SELECT * FROM people WHERE id=?", (pid,)).fetchone()
     if not row:
         raise HTTPException(404, "人员不存在")

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from app.routers.auth import audit, db_conn, get_current_person
 
 router = APIRouter(prefix="/api/scenarios", tags=["scenarios"])
+SCENARIO_PRIORITIES = ("高", "中", "低")
 
 
 def _view(row):
@@ -38,6 +39,9 @@ def list_scenarios(platform_id: int = None, dept_id: int = None, status: str = N
     if priority:
         cond.append("s.priority=?")
         args.append(priority)
+    if person["tier"] == "staff":
+        cond.append("s.dept_id=?")
+        args.append(person["dept_id"])
     if cond:
         sql += " WHERE " + " AND ".join(cond)
     sql += " ORDER BY s.id"
@@ -54,12 +58,27 @@ def create_scenario(body: dict = Body(...), conn=Depends(db_conn),
         raise HTTPException(400, "name 与 dept_id 必填")
     if not conn.execute("SELECT id FROM departments WHERE id=?", (dept_id,)).fetchone():
         raise HTTPException(404, "部门不存在")
+    if person["tier"] == "staff" and dept_id != person["dept_id"]:
+        raise HTTPException(403, "普通员工只能申报本部门场景")
+    priority = body.get("priority", "中")
+    if priority not in SCENARIO_PRIORITIES:
+        raise HTTPException(422, f"priority 仅允许：{'/'.join(SCENARIO_PRIORITIES)}")
+    actions = body.get("actions", [])
+    if not isinstance(actions, list):
+        raise HTTPException(422, "actions 必须是数组")
+    agent_id = body.get("agent_id")
+    if agent_id:
+        agent = conn.execute("SELECT dept_id FROM agents WHERE id=?", (agent_id,)).fetchone()
+        if not agent:
+            raise HTTPException(404, "关联数字员工不存在")
+        if agent["dept_id"] != dept_id:
+            raise HTTPException(422, "关联数字员工必须属于场景所在部门")
     sid = conn.execute(
         "INSERT INTO scenarios(dept_id,agent_id,name,description,priority,batch,status,"
         "expected_benefit,actions) VALUES(?,?,?,?,?,?,'待立项',?,?)",
-        (dept_id, body.get("agent_id"), name, body.get("description", ""),
-         body.get("priority", "中"), body.get("batch", "扩围"), body.get("expected_benefit", ""),
-         json.dumps(body.get("actions", []), ensure_ascii=False))).lastrowid
+        (dept_id, agent_id, name, body.get("description", ""),
+         priority, body.get("batch", "扩围"), body.get("expected_benefit", ""),
+         json.dumps(actions, ensure_ascii=False))).lastrowid
     conn.commit()
     audit(conn, person["name"], "立项申报", name, f"申报人 {person['name']} 提交敏捷立项申报")
     return _view(conn.execute("SELECT * FROM scenarios WHERE id=?", (sid,)).fetchone())
@@ -68,6 +87,8 @@ def create_scenario(body: dict = Body(...), conn=Depends(db_conn),
 @router.post("/{sid}/initiate")
 def initiate_scenario(sid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
     """立项：状态→已立项，自动建项目工作区并拉入关联 agent 与申请人"""
+    if person["tier"] not in ("boss", "coach", "backbone"):
+        raise HTTPException(403, "仅高管、教练团或业务骨干可批准场景立项")
     sc = conn.execute("SELECT * FROM scenarios WHERE id=?", (sid,)).fetchone()
     if not sc:
         raise HTTPException(404, "场景不存在")

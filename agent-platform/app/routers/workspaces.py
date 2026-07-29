@@ -5,6 +5,7 @@ from datetime import datetime
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from app import engine
+from app.access import require_workspace, workspace_scope_sql
 from app.routers.auth import audit, db_conn, get_current_person
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
@@ -39,9 +40,16 @@ def list_workspaces(type: str = None, conn=Depends(db_conn), person=Depends(get_
     sql = ("SELECT w.*, p.name creator_name, s.name scenario_name FROM workspaces w "
            "LEFT JOIN people p ON p.id=w.created_by LEFT JOIN scenarios s ON s.id=w.scenario_id")
     args = []
+    conds = []
     if type:
-        sql += " WHERE w.type=?"
+        conds.append("w.type=?")
         args.append(type)
+    scope, scope_args = workspace_scope_sql(person, "w")
+    if scope:
+        conds.append(scope)
+        args.extend(scope_args)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
     sql += " ORDER BY w.id"
     out = []
     for r in conn.execute(sql, args):
@@ -55,6 +63,8 @@ def list_workspaces(type: str = None, conn=Depends(db_conn), person=Depends(get_
 @router.post("")
 def create_workspace(body: dict = Body(...), conn=Depends(db_conn),
                      person=Depends(get_current_person)):
+    if person["tier"] == "staff":
+        raise HTTPException(403, "普通员工请在已有工作区派活；创建工作区请联系项目负责人")
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "name 必填")
@@ -65,10 +75,14 @@ def create_workspace(body: dict = Body(...), conn=Depends(db_conn),
     conn.execute("INSERT INTO workspace_members(workspace_id,member_type,member_id) VALUES(?,?,?)",
                  (wid, "human", person["id"]))
     # 可选：初始成员 {"humans":[id...], "agents":[id...]}
-    for pid in body.get("humans", []):
+    for pid in sorted(set(body.get("humans", [])) - {person["id"]}):
+        if not conn.execute("SELECT 1 FROM people WHERE id=? AND status='在职'", (pid,)).fetchone():
+            raise HTTPException(422, f"人员 #{pid} 不存在或已停用")
         conn.execute("INSERT INTO workspace_members(workspace_id,member_type,member_id) VALUES(?,?,?)",
                      (wid, "human", pid))
-    for aid in body.get("agents", []):
+    for aid in sorted(set(body.get("agents", []))):
+        if not conn.execute("SELECT 1 FROM agents WHERE id=?", (aid,)).fetchone():
+            raise HTTPException(422, f"数字员工 #{aid} 不存在")
         conn.execute("INSERT INTO workspace_members(workspace_id,member_type,member_id) VALUES(?,?,?)",
                      (wid, "agent", aid))
     conn.execute(
@@ -89,6 +103,7 @@ def get_workspace(wid: int, conn=Depends(db_conn), person=Depends(get_current_pe
         "WHERE w.id=?", (wid,)).fetchone()
     if not row:
         raise HTTPException(404, "工作区不存在")
+    require_workspace(conn, wid, person)
     d = dict(row)
     d["members"] = _members(conn, wid)
     return d
@@ -99,6 +114,7 @@ def list_messages(wid: int, zone: str = None, limit: int = 200, conn=Depends(db_
                   person=Depends(get_current_person)):
     if not conn.execute("SELECT id FROM workspaces WHERE id=?", (wid,)).fetchone():
         raise HTTPException(404, "工作区不存在")
+    require_workspace(conn, wid, person)
     sql = "SELECT * FROM messages WHERE workspace_id=?"
     args = [wid]
     if zone:
@@ -128,6 +144,7 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
     ws = conn.execute("SELECT * FROM workspaces WHERE id=?", (wid,)).fetchone()
     if not ws:
         raise HTTPException(404, "工作区不存在")
+    require_workspace(conn, wid, person)
     content = (body.get("content") or "").strip()
     zone = body.get("zone", "discussion")
     if not content:
@@ -169,8 +186,15 @@ def post_message(wid: int, body: dict = Body(...), conn=Depends(db_conn),
     if dispatched:
         audit(conn, person["name"], "派发任务", f"工作区#{wid}",
               f"派发 {len(dispatched)} 个任务：" + ",".join(str(t["task_id"]) for t in dispatched))
-    return {"message": _msg_view(conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()),
+    resp = {"message": _msg_view(conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()),
             "dispatched": dispatched}
+    # R5 兜底：agent 区发言未派发成功时，不静默成功——说明原因、推荐在线员工、登记待处理需求
+    if zone == "agent" and not dispatched:
+        resp["undispatched"] = engine.handle_undispatched(conn, wid, person, content)
+        conn.commit()
+        audit(conn, person["name"], "派活兜底登记", f"工作区#{wid}",
+              f"未派发，登记待处理任务 #{resp['undispatched']['pending_task_id']}")
+    return resp
 
 
 @router.get("/{wid}/chain")
@@ -178,6 +202,7 @@ def workspace_chain(wid: int, conn=Depends(db_conn), person=Depends(get_current_
     """R4-6 执行链路（前端可视化）：过去（任务事件）→ 现在（进行中/待审核）→ 未来（流程后续 6 节点）"""
     if not conn.execute("SELECT id FROM workspaces WHERE id=?", (wid,)).fetchone():
         raise HTTPException(404, "工作区不存在")
+    require_workspace(conn, wid, person)
     past, present = [], []
     tasks = conn.execute(
         "SELECT t.*, a.name agent_name FROM tasks t LEFT JOIN agents a ON a.id=t.agent_id "

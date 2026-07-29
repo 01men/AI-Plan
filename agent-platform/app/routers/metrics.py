@@ -2,8 +2,9 @@
 import json
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.access import workspace_scope_sql
 from app.routers.auth import db_conn, get_current_person
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"])
@@ -82,17 +83,28 @@ def dashboard(conn=Depends(db_conn), person=Depends(get_current_person)):
             day_map[r["date"]] = {"tasks_done": r["t"], "hours_saved": r["h"]}
     trend = [{"date": d, **v} for d, v in sorted(day_map.items())]
 
-    feed = [dict(r) for r in conn.execute(
-        "SELECT m.id, m.workspace_id, w.name workspace_name, m.sender_type, m.sender_name,"
-        " m.zone, m.msg_type, m.content, m.created_at FROM messages m "
+    scope, scope_args = workspace_scope_sql(person, "w")
+    feed_sql = (
+        "SELECT m.id,m.workspace_id,w.name workspace_name,m.sender_type,m.sender_name,"
+        "m.zone,m.msg_type,m.content,m.created_at FROM messages m "
         "JOIN workspaces w ON w.id=m.workspace_id "
-        "WHERE m.sender_type IN ('system','agent') ORDER BY m.id DESC LIMIT 12")]
+        "WHERE m.sender_type IN ('system','agent')"
+    )
+    if scope:
+        feed_sql += " AND " + scope
+    feed_sql += " ORDER BY m.id DESC LIMIT 12"
+    feed = [dict(r) for r in conn.execute(feed_sql, scope_args)]
 
     # 全库最新一条日报（供前端在动态流顶部固定展示，无则 None）
-    row = conn.execute(
+    report_sql = (
         "SELECT m.id, m.workspace_id, w.name workspace_name, m.sender_name, m.content,"
         " m.created_at FROM messages m JOIN workspaces w ON w.id=m.workspace_id "
-        "WHERE m.msg_type='report' ORDER BY m.id DESC LIMIT 1").fetchone()
+        "WHERE m.msg_type='report'"
+    )
+    if scope:
+        report_sql += " AND " + scope
+    report_sql += " ORDER BY m.id DESC LIMIT 1"
+    row = conn.execute(report_sql, scope_args).fetchone()
     latest_report = dict(row) if row else None
 
     return {
@@ -120,7 +132,36 @@ def dashboard(conn=Depends(db_conn), person=Depends(get_current_person)):
 
 @router.get("/agents")
 def agent_metrics(conn=Depends(db_conn), person=Depends(get_current_person)):
-    return [dict(r) for r in conn.execute(
-        "SELECT a.id, a.name, a.code, a.status, a.wave, d.name dept_name, a.tasks_done,"
-        " a.hours_saved, a.accuracy FROM agents a JOIN departments d ON d.id=a.dept_id "
-        "ORDER BY a.tasks_done DESC")]
+    sql = (
+        "SELECT a.id,a.name,a.code,a.status,a.wave,d.name dept_name,a.tasks_done,"
+        "a.hours_saved,a.accuracy FROM agents a JOIN departments d ON d.id=a.dept_id"
+    )
+    args = []
+    if person["tier"] == "staff":
+        sql += (" WHERE a.id IN (SELECT wm.member_id FROM workspace_members wm "
+                "JOIN workspace_members hm ON hm.workspace_id=wm.workspace_id "
+                "WHERE wm.member_type='agent' AND hm.member_type='human' AND hm.member_id=?)")
+        args.append(person["id"])
+    sql += " ORDER BY a.tasks_done DESC"
+    return [dict(r) for r in conn.execute(sql, args)]
+
+
+@router.get("/people")
+def people_metrics(conn=Depends(db_conn), person=Depends(get_current_person)):
+    """B-1：人级 AI 使用成效，只向管理角色开放。"""
+    if person["tier"] not in ("boss", "coach", "backbone"):
+        raise HTTPException(403, "仅高管、教练团或业务骨干可查看人级成效")
+    rows = conn.execute(
+        "SELECT p.id,p.name,p.role_title,p.tier,d.name dept_name,"
+        "(SELECT COUNT(*) FROM tasks t WHERE t.creator_id=p.id) tasks_created,"
+        "(SELECT COUNT(*) FROM tasks t WHERE t.creator_id=p.id AND t.status='已通过') tasks_approved,"
+        "(SELECT COUNT(*) FROM tasks t WHERE t.creator_id=p.id "
+        " AND t.status IN ('待处理','进行中','待审核')) tasks_open,"
+        "(SELECT MAX(x.ts) FROM ("
+        " SELECT created_at ts FROM tasks WHERE creator_id=p.id"
+        " UNION ALL SELECT created_at ts FROM messages WHERE sender_type='human' AND sender_id=p.id"
+        ") x) last_active "
+        "FROM people p JOIN departments d ON d.id=p.dept_id "
+        "ORDER BY tasks_created DESC,last_active DESC,p.id"
+    ).fetchall()
+    return [dict(r) for r in rows]

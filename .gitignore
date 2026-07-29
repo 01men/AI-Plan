@@ -7,13 +7,17 @@ agent-platform/data/*.db
 agent-platform/data/*.db-journal
 agent-platform/data/*.db-wal
 agent-platform/data/*.db-shm
+agent-platform/data/**/*.db*
 agent-platform/data/*.log
+agent-platform/data/.secret_key
+agent-platform/data/master.key
 agent-platform/data/uploads/
 agent-platform/data/knowledge/
 multica-platform/data/*.db
 multica-platform/data/*.db-journal
 multica-platform/data/*.db-wal
 multica-platform/data/*.db-shm
+multica-platform/data/**/*.db*
 multica-platform/data/*.log
 
 # 验收截图（报告 md 保留，图片不入库）

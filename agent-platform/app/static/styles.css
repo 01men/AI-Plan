@@ -187,6 +187,22 @@ details[open] .tree-arrow { transform: rotate(90deg); }
   #app-view.sidebar-open > aside { transform: translateX(0); }
   #app-view > .ml-60 { margin-left: 0; }
 }
+@media (max-width: 640px) {
+  html, body { overflow-x: hidden; }
+  #view-container { padding: .75rem !important; }
+  #app-view header { padding-left: .75rem !important; padding-right: .75rem !important; }
+  #app-view header h1 { font-size: 1.05rem !important; }
+  .view-hint { margin-bottom: .65rem; padding: .5rem .65rem; }
+  .workspace-layout { display: block !important; height: auto !important; }
+  .workspace-list { width: 100% !important; max-height: 12rem; margin-bottom: .75rem; }
+  #ws-panel { width: 100%; height: calc(100vh - 18rem); min-height: 34rem; }
+  #ws-panel .zone-tab { padding-left: .45rem; padding-right: .45rem; font-size: .72rem; }
+  #ws-panel .form-textarea { min-width: 0; }
+  .modal-mask { padding: .65rem; }
+  .modal-card { padding: 1rem; max-height: 92vh; }
+  .drawer-panel { width: 100vw; max-width: 100vw; }
+  .data-card { padding: .85rem; }
+}
 
 /* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar { width: 8px; height: 8px; }

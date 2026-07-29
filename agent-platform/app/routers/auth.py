@@ -1,6 +1,7 @@
-"""认证与公共依赖：登录、当前用户、审计工具"""
-import uuid
-from datetime import datetime
+"""认证与公共依赖：登录、当前用户、会话撤销、审计工具"""
+import json
+import secrets
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
@@ -38,7 +39,19 @@ def get_current_person(authorization: str = Header(None), conn=Depends(db_conn))
     row = conn.execute("SELECT value FROM settings WHERE key=?", (f"token:{token}",)).fetchone()
     if not row:
         raise HTTPException(401, "Token 无效或已过期")
-    person = conn.execute("SELECT * FROM people WHERE id=?", (int(row["value"]),)).fetchone()
+    try:
+        payload = json.loads(row["value"])
+        if isinstance(payload, dict):
+            if datetime.fromisoformat(payload["expires_at"]) < datetime.now():
+                conn.execute("DELETE FROM settings WHERE key=?", (f"token:{token}",))
+                conn.commit()
+                raise HTTPException(401, "登录已过期，请重新进入")
+            person_id = int(payload["person_id"])
+        else:
+            person_id = int(payload)
+    except (json.JSONDecodeError, TypeError):
+        person_id = int(row["value"])  # 兼容旧会话
+    person = conn.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
     if not person:
         raise HTTPException(401, "账号不存在")
     return person_view(conn, person)
@@ -56,18 +69,38 @@ class LoginIn(BaseModel):
     person_id: int
 
 
+def issue_session(conn, person_id: int, hours: int = 12):
+    person = conn.execute(
+        "SELECT * FROM people WHERE id=? AND status='在职'", (person_id,)
+    ).fetchone()
+    if not person:
+        raise HTTPException(404, "人员不存在或账号已停用")
+    token = secrets.token_urlsafe(32)
+    payload = {
+        "person_id": person["id"],
+        "expires_at": (datetime.now() + timedelta(hours=hours)).isoformat(timespec="seconds"),
+    }
+    conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
+                 (f"token:{token}", json.dumps(payload, ensure_ascii=False)))
+    conn.commit()
+    return {"token": token, "person": person_view(conn, person)}
+
+
 @router.post("/login")
 def login(body: LoginIn, conn=Depends(db_conn)):
-    person = conn.execute("SELECT * FROM people WHERE id=?", (body.person_id,)).fetchone()
-    if not person:
-        raise HTTPException(404, "人员不存在")
-    token = uuid.uuid4().hex
-    conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"token:{token}", str(person["id"])))
-    conn.commit()
     # 登录是高频流水，不写 audits，避免刷屏淹没真实操作审计
-    return {"token": token, "person": person_view(conn, person)}
+    return issue_session(conn, body.person_id)
 
 
 @router.get("/me")
 def me(person=Depends(get_current_person)):
     return person
+
+
+@router.post("/logout")
+def logout(authorization: str = Header(None), conn=Depends(db_conn)):
+    if authorization and authorization.startswith("Bearer "):
+        conn.execute("DELETE FROM settings WHERE key=?",
+                     (f"token:{authorization[7:].strip()}",))
+        conn.commit()
+    return {"ok": True}

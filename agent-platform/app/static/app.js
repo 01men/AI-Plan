@@ -24,7 +24,7 @@ const INCENTIVE_TIER_HINT = {
   '火花奖': '档位参考：500 – 2,000 元（小额即时激励）',
   '银齿轮奖': '档位参考：5,000 – 10,000 元',
   '金扳手奖': '档位参考：30,000 – 50,000 元',
-  '种子基金': '档位参考：不设上下限，按项目评审确定',
+  '种子基金': '档位参考：1 – 100,000 元（年度激励池上限）',
 };
 const SCENARIO_STATUS_META = { '待立项': 'bg-gray-400', '已立项': 'bg-secondary', '开发中': 'bg-accent', '试点中': 'bg-teal', '已验收': 'bg-success', '已下线': 'bg-danger' };
 const ZONE_META = {
@@ -125,7 +125,13 @@ function openModal(html) {
   document.getElementById('modal-root').innerHTML =
     '<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal-card">' + html + '</div></div>';
 }
-function closeModal() { document.getElementById('modal-root').innerHTML = ''; }
+function closeModal() {
+  document.getElementById('modal-root').innerHTML = '';
+  if (typeof oauthPollTimer !== 'undefined' && oauthPollTimer) {
+    clearInterval(oauthPollTimer);
+    oauthPollTimer = null;
+  }
+}
 function openDrawer(html) {
   document.getElementById('drawer-root').innerHTML =
     '<div class="drawer-mask" onclick="closeDrawer()"></div><div class="drawer-panel">' + html + '</div>';
@@ -228,6 +234,25 @@ const VIEWS = [
   { key: 'governance', name: '治理中心',   render: renderGovernance },
   { key: 'roadmap',    name: '路线图',     render: renderRoadmap },
 ];
+const VIEW_TIERS = {
+  dashboard: ['boss', 'coach', 'backbone', 'developer'],
+  workspaces: ['boss', 'coach', 'backbone', 'developer', 'staff'],
+  agents: ['boss', 'coach', 'backbone', 'developer'],
+  scenarios: ['boss', 'coach', 'backbone', 'developer'],
+  tasks: ['boss', 'coach', 'backbone', 'developer', 'staff'],
+  flows: ['boss', 'coach', 'backbone', 'developer'],
+  skills: ['boss', 'coach', 'backbone', 'developer'],
+  knowledge: ['boss', 'coach', 'backbone', 'developer', 'staff'],
+  org: ['boss', 'coach', 'backbone', 'developer'],
+  governance: ['boss', 'coach', 'backbone', 'developer'],
+  roadmap: ['boss', 'coach', 'backbone', 'developer'],
+};
+function availableViews() {
+  const tier = state.person && state.person.tier;
+  return VIEWS.filter(function (v) {
+    return (VIEW_TIERS[v.key] || []).indexOf(tier) >= 0;
+  });
+}
 /* 每个视图顶部的一行人话说明（低学习门槛） */
 const VIEW_HINTS = {
   dashboard:  '全公司 AI 推进情况一目了然',
@@ -244,10 +269,12 @@ const VIEW_HINTS = {
 };
 function currentViewKey() {
   const h = (location.hash || '').replace(/^#\/?/, '').split('/')[0];
-  return VIEWS.some(function (v) { return v.key === h; }) ? h : 'dashboard';
+  const visible = availableViews();
+  return visible.some(function (v) { return v.key === h; }) ? h :
+    ((visible[0] || {}).key || 'workspaces');
 }
 function buildSidebar() {
-  document.getElementById('side-nav').innerHTML = VIEWS.map(function (v) {
+  document.getElementById('side-nav').innerHTML = availableViews().map(function (v) {
     return '<a class="nav-item" data-view="' + v.key + '" href="#/' + v.key + '">' +
       '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24">' + ICON[v.key] + '</svg><span>' + v.name + '</span></a>';
   }).join('');
@@ -293,7 +320,12 @@ async function route() {
   disposeCharts();
   closeDrawer();
   const key = currentViewKey();
-  const view = VIEWS.find(function (v) { return v.key === key; });
+  const view = availableViews().find(function (v) { return v.key === key; });
+  const requested = (location.hash || '').replace(/^#\/?/, '').split('/')[0];
+  if (requested && requested !== key) {
+    location.hash = '#/' + key;
+    return;
+  }
   document.querySelectorAll('#side-nav .nav-item').forEach(function (n) {
     n.classList.toggle('active', n.dataset.view === key);
   });
@@ -328,8 +360,10 @@ async function bootLogin() {
   const box = document.getElementById('login-people');
   box.innerHTML = '<div class="text-gray-300 flex items-center space-x-2"><span class="spinner"></span><span>正在加载组织人员…</span></div>';
   try {
-    const people = await api('/api/people');
+    const people = await api('/api/login/people');
     loginPeopleCache = people;
+    try { publicImProviders = await api('/api/auth/providers/public'); }
+    catch (e) { publicImProviders = []; }
     let html = '';
     TIER_ORDER.forEach(function (tier) {
       const group = people.filter(function (p) { return p.tier === tier; });
@@ -356,19 +390,25 @@ async function bootLogin() {
 async function doLogin(personId) {
   try {
     const r = await postApi('/api/login', { person_id: personId });
-    state.token = r.token;
-    state.person = r.person;
-    localStorage.setItem('rq_token', r.token);
-    localStorage.setItem('rq_person', JSON.stringify(r.person));
+    acceptSession(r);
     toast('欢迎，' + r.person.name + '（' + (TIER_META[r.person.tier] || {}).label + '）');
     enterApp();
   } catch (e) {
     toast(e.message, 'error');
   }
 }
+function acceptSession(r) {
+  state.token = r.token;
+  state.person = r.person;
+  localStorage.setItem('rq_token', r.token);
+  localStorage.setItem('rq_person', JSON.stringify(r.person));
+}
 function enterApp() {
   document.getElementById('login-view').classList.add('hidden');
   document.getElementById('app-view').classList.remove('hidden');
+  buildSidebar();
+  document.getElementById('btn-heartbeat').classList.toggle(
+    'hidden', !state.person || ['boss', 'coach', 'backbone'].indexOf(state.person.tier) < 0);
   renderSidebarUser();
   renderTopbarUser();
   if (!location.hash) {
@@ -379,6 +419,11 @@ function enterApp() {
   route();
 }
 function doLogout() {
+  if (state.token) {
+    fetch('/api/logout', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + state.token }
+    }).catch(function () {});
+  }
   localStorage.removeItem('rq_token');
   localStorage.removeItem('rq_person');
   state.token = '';
@@ -397,10 +442,23 @@ const IM_PROVIDER_META = {
 };
 let loginPeopleCache = null;   // 登录页人员（免 token 接口拉到，IM 登录选人用）
 let imProvidersCache = null;   // /api/auth/providers 结果（配置弹窗回显用）
+let publicImProviders = [];
+let oauthPollTimer = null;
 
 /* 登录页入口：未登录拿不到授权 URL（需 token），演示模式下直接选人模拟 IM 身份完成绑定并进入 */
-function imLogin(provider) {
+async function imLogin(provider) {
   const meta = IM_PROVIDER_META[provider] || { label: provider };
+  const conf = (publicImProviders || []).find(function (x) { return x.provider === provider; });
+  if (conf && conf.configured) {
+    try {
+      const r = await api('/api/auth/oauth/' + provider + '/login-url');
+      openQrModal(provider, r.url, r.request_id, true);
+      return;
+    } catch (e) {
+      toast(e.message, 'error');
+      return;
+    }
+  }
   const people = loginPeopleCache || [];
   openModal('<h3 class="font-bold text-primary text-lg mb-1">使用' + meta.label + '账号进入</h3>' +
     '<p class="text-xs text-gray-500 mb-3">真实环境下这里会弹出' + meta.label + '扫码授权；演示环境请直接选择你的身份，' +
@@ -485,13 +543,16 @@ async function startImBind(provider) {
     }
   } catch (e) { toast(e.message, 'error'); }
 }
-function openQrModal(provider, url) {
+function openQrModal(provider, url, requestId, isLogin) {
   const meta = IM_PROVIDER_META[provider];
+  if (oauthPollTimer) { clearInterval(oauthPollTimer); oauthPollTimer = null; }
   openModal('<h3 class="font-bold text-primary text-lg mb-1">' + meta.label + '扫码授权</h3>' +
-    '<p class="text-xs text-gray-500 mb-3">用手机' + meta.label + '扫码，在手机上确认授权后即完成绑定；回到本页面可重新打开「IM 绑定」查看结果。</p>' +
+    '<p class="text-xs text-gray-500 mb-3">用手机' + meta.label + '扫码并确认授权；二维码组件已随平台本地部署，不依赖公网 CDN。</p>' +
     '<div class="flex flex-col items-center py-2"><canvas id="qr-canvas"></canvas>' +
       '<div id="qr-fallback" class="hidden text-xs text-gray-400 mt-2">二维码组件加载失败，请复制链接到手机打开：</div>' +
-      '<div class="text-[11px] text-gray-400 break-all mt-2 max-w-full">' + esc(url) + '</div></div>' +
+      '<a target="_blank" rel="noopener" class="text-xs text-secondary underline mt-2" href="' + esc(url) + '">无法扫码？在当前电脑打开授权页</a>' +
+      '<div id="oauth-poll-state" class="text-[11px] text-gray-400 mt-2">' +
+        (isLogin ? '等待扫码确认…' : '授权后点击“我已完成授权”刷新状态') + '</div></div>' +
     '<div class="flex justify-end space-x-2 mt-3">' +
       '<button class="btn-ghost" onclick="openImBindModal()">返回</button>' +
       '<button class="btn-primary" onclick="openImBindModal()">我已完成授权</button></div>');
@@ -501,6 +562,23 @@ function openQrModal(provider, url) {
     });
   } else {
     document.getElementById('qr-fallback').classList.remove('hidden');
+  }
+  if (isLogin && requestId) {
+    oauthPollTimer = setInterval(async function () {
+      try {
+        const r = await api('/api/auth/oauth/poll?request_id=' + encodeURIComponent(requestId));
+        if (!r.pending && r.token) {
+          clearInterval(oauthPollTimer); oauthPollTimer = null;
+          closeModal();
+          acceptSession(r);
+          toast(meta.label + '身份验证成功，欢迎 ' + r.person.name);
+          enterApp();
+        }
+      } catch (e) {
+        clearInterval(oauthPollTimer); oauthPollTimer = null;
+        toast(e.message, 'error');
+      }
+    }, 2000);
   }
 }
 async function unbindIm(provider) {
@@ -745,9 +823,9 @@ async function renderWorkspaces(c) {
   if (!wsState.id || !list.some(function (w) { return w.id === wsState.id; })) {
     wsState.id = list.length ? list[0].id : null;
   }
-  let html = '<div class="flex gap-5" style="height:calc(100vh - 7.5rem)">';
+  let html = '<div class="workspace-layout flex gap-5" style="height:calc(100vh - 7.5rem)">';
   /* 左栏：工作区列表 */
-  html += '<div class="w-72 shrink-0 data-card !p-3 flex flex-col"><div class="text-sm font-bold text-primary px-2 py-1">工作区列表（' + list.length + '）</div>' +
+  html += '<div class="workspace-list w-72 shrink-0 data-card !p-3 flex flex-col"><div class="text-sm font-bold text-primary px-2 py-1">工作区列表（' + list.length + '）</div>' +
     '<div class="flex-1 overflow-y-auto space-y-1.5 mt-1">';
   if (!list.length) html += emptyHtml('暂无工作区，可先到场景库发起敏捷立项');
   list.forEach(function (w) {
@@ -950,6 +1028,17 @@ function deliverableHtml(m, t) {
       }
     }
   }
+  /* R5 模型溯源：交付物来自真实模型还是模板，审核人可追溯 */
+  const mi = p.model_info;
+  let modelLine = '';
+  if (mi) {
+    modelLine = mi.fallback
+      ? '<div class="text-[11px] text-amber-600 mt-1">模板模拟生成' +
+        (mi.provider ? '（' + esc(mi.provider) + ' 调用失败已回落' +
+          (mi.reason ? '：' + esc(String(mi.reason).slice(0, 60)) : '') + '）' : '（未配置可用模型）') + '</div>'
+      : '<div class="text-[11px] text-teal mt-1">真实模型生成：' + esc(mi.provider || '-') +
+        ' / ' + esc(mi.model || '-') + ' · ' + (mi.latency_ms || 0) + 'ms</div>';
+  }
   return '<div class="flex my-3"><div class="msg-avatar bg-accent mr-2">' + ROBOT_SVG + '</div>' +
     '<div class="deliverable-card">' +
       '<div class="flex items-center justify-between flex-wrap gap-1">' +
@@ -960,6 +1049,7 @@ function deliverableHtml(m, t) {
         (effStatus ? statusBadge(effStatus, TASK_STATUS_META) : '') + '</div>' +
         '<span class="text-xs text-gray-400">任务 #' + (p.task_id ?? '-') + ' · ' + t + '</span></div>' +
       '<div class="deliverable-body mt-2">' + mdLite(m.content) + '</div>' +
+      modelLine +
       actionBar +
     '</div></div>';
 }
@@ -1011,7 +1101,12 @@ async function sendWsMessage() {
     updateDispatchHint();
     const n = (r.dispatched || []).length;
     if (n) toast('已派发任务给：' + r.dispatched.map(function (d) { return d.agent_name; }).join('、'), 'info');
-    await loadMessages(n > 0);
+    /* R5 兜底：无可用数字员工时明确告知，需求已登记为待处理任务 */
+    if (r.undispatched) {
+      toast('数字员工暂时不可用，已登记待处理需求 #' + r.undispatched.pending_task_id +
+        '，可在任务中心跟进', 'error');
+    }
+    await loadMessages(n > 0 || !!r.undispatched);
   } catch (e) { toast(e.message, 'error'); }
 }
 /* 审核（协作空间内） */
@@ -1281,12 +1376,19 @@ function openModelKeyModal() {
         }).join('') + '</select></div>' +
       '<div><label class="form-label">API Key</label><input id="mk-key" class="form-input" type="password" placeholder="">' +
         '<div id="mk-key-state" class="text-[11px] text-gray-400 mt-1"></div></div>' +
+      '<div><label class="form-label">接口地址 Base URL</label><input id="mk-baseurl" class="form-input" placeholder=""></div>' +
       '<div><label class="form-label">默认模型名</label><input id="mk-model" class="form-input" placeholder=""></div>' +
+      '<div class="grid grid-cols-2 gap-3">' +
+        '<div><label class="form-label">温度 temperature</label><input id="mk-temp" class="form-input" type="number" min="0" max="2" step="0.1" placeholder="0.4">' +
+          '<div class="text-[11px] text-gray-400 mt-1">Kimi Coding 等要求 1.0 的服务请改为 1</div></div>' +
+        '<div><label class="form-label">超时（秒）</label><input id="mk-timeout" class="form-input" type="number" min="5" max="120" step="1" placeholder="30"></div></div>' +
       '<label class="inline-flex items-center gap-2 text-sm text-gray-600 cursor-pointer">' +
         '<input type="checkbox" id="mk-enabled" class="accent-secondary">启用该供应商（停用后引用它的数字员工回落模板）</label>' +
+      '<div id="mk-test-result" class="text-xs"></div>' +
     '</div>' +
     '<div class="flex justify-end space-x-2 mt-4">' +
       '<button class="btn-ghost" onclick="closeModal()">取消</button>' +
+      '<button class="btn-ghost" onclick="testModelConn()">测试连接</button>' +
       '<button class="btn-primary" onclick="submitModelKey()">保存配置</button></div>');
   fillModelKeyForm();
 }
@@ -1294,17 +1396,41 @@ function fillModelKeyForm() {
   const key = document.getElementById('mk-provider').value;
   const m = (cache.models || []).find(function (x) { return x.key === key; }) || {};
   document.getElementById('mk-key').placeholder = m.api_key === '已配置' ? '已配置（留空保持不变）' : '粘贴 API Key';
-  document.getElementById('mk-key-state').textContent = '当前状态：' + (m.api_key || '未配置') + ' · 接口 ' + (m.base_url || '-');
+  document.getElementById('mk-key-state').textContent = '当前状态：' + (m.api_key || '未配置');
+  document.getElementById('mk-baseurl').placeholder = m.base_url || 'https://...';
+  document.getElementById('mk-baseurl').value = m.base_url || '';
   document.getElementById('mk-model').placeholder = m.default_model || '如 glm-4-flash';
+  document.getElementById('mk-temp').value = (m.temperature != null) ? m.temperature : 0.4;
+  document.getElementById('mk-timeout').value = m.timeout || 30;
   document.getElementById('mk-enabled').checked = !!m.enabled;
+  document.getElementById('mk-test-result').innerHTML = '';
+}
+async function testModelConn() {
+  const key = document.getElementById('mk-provider').value;
+  const box = document.getElementById('mk-test-result');
+  box.innerHTML = '<span class="text-gray-400">正在测试连接…</span>';
+  try {
+    const r = await postApi('/api/models/' + key + '/test', {});
+    box.innerHTML = r.ok
+      ? '<span class="text-success">连接成功 · ' + r.latency_ms + 'ms · 可用模型 ' + r.models_count + ' 个</span>'
+      : '<span class="text-danger">连接失败：' + esc(r.error || '未知错误') + '</span>';
+  } catch (e) {
+    box.innerHTML = '<span class="text-danger">连接失败：' + esc(e.message) + '</span>';
+  }
 }
 async function submitModelKey() {
   const key = document.getElementById('mk-provider').value;
   const body = { enabled: document.getElementById('mk-enabled').checked };
   const apiKey = document.getElementById('mk-key').value.trim();
+  const baseUrl = document.getElementById('mk-baseurl').value.trim();
   const model = document.getElementById('mk-model').value.trim();
+  const temp = document.getElementById('mk-temp').value.trim();
+  const timeout = document.getElementById('mk-timeout').value.trim();
   if (apiKey) body.api_key = apiKey;
+  if (baseUrl) body.base_url = baseUrl;
   if (model) body.default_model = model;
+  if (temp) body.temperature = parseFloat(temp);
+  if (timeout) body.timeout = parseInt(timeout, 10);
   try {
     await putApi('/api/models/' + key, body);
     closeModal();
@@ -2037,9 +2163,31 @@ async function submitDoc() {
 async function renderOrg(c) {
   c.innerHTML = loadingHtml('加载组织树…');
   const tree = await api('/api/org/tree');
+  let peopleMetrics = [];
+  if (canReview()) {
+    try { peopleMetrics = await api('/api/metrics/people'); } catch (e) { peopleMetrics = []; }
+  }
   let html = '<div class="data-card !py-3 mb-4 flex items-center space-x-3 bg-gradient-to-r from-primary/5 to-teal/5">' +
     '<svg class="w-6 h-6 text-teal shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>' +
     '<div class="text-sm text-gray-600">Teams.md 理念：<b class="text-primary">AI 通过通讯录理解组织</b>，调度人与数字员工协同作战——五个业务平台、部门与数字员工在此一图总览。</div></div>';
+  if (peopleMetrics.length) {
+    const active = peopleMetrics.filter(function (p) { return p.last_active; }).length;
+    const totalTasks = peopleMetrics.reduce(function (n, p) { return n + (p.tasks_created || 0); }, 0);
+    html += '<div class="data-card mb-4"><div class="flex items-center justify-between mb-3">' +
+      '<div><div class="font-bold text-primary">个人 AI 使用成效</div>' +
+      '<div class="text-xs text-gray-400">供 HR/管理层识别活跃度、产出与待跟进人员</div></div>' +
+      '<div class="flex gap-2"><span class="badge bg-secondary">有使用记录 ' + active + ' 人</span>' +
+      '<span class="badge bg-teal">累计发起 ' + totalTasks + ' 项</span></div></div>' +
+      '<div class="overflow-x-auto max-h-72 overflow-y-auto"><table class="gov-table w-full"><thead><tr>' +
+      '<th>人员</th><th>部门/角色</th><th>发起任务</th><th>已通过</th><th>待处理</th><th>最近活跃</th></tr></thead><tbody>' +
+      peopleMetrics.map(function (p) {
+        return '<tr><td class="font-medium whitespace-nowrap">' + esc(p.name) + '</td>' +
+          '<td>' + esc(p.dept_name || '-') + ' · ' + esc((TIER_META[p.tier] || {}).label || p.tier) + '</td>' +
+          '<td>' + (p.tasks_created || 0) + '</td><td class="text-success">' + (p.tasks_approved || 0) + '</td>' +
+          '<td class="' + ((p.tasks_open || 0) ? 'text-accent font-bold' : '') + '">' + (p.tasks_open || 0) + '</td>' +
+          '<td class="whitespace-nowrap">' + fmtTime(p.last_active) + '</td></tr>';
+      }).join('') + '</tbody></table></div></div>';
+  }
   tree.forEach(function (p) {
     let deptCount = (p.departments || []).length;
     let agentCount = 0, peopleCount = 0;
@@ -2088,6 +2236,11 @@ const GOV_TABS = [
   { key: 'audits', name: '审计日志' },
   { key: 'redlines', name: '开发红线' },
 ];
+function availableGovTabs() {
+  if (!state.person) return [];
+  if (['boss', 'coach', 'backbone'].indexOf(state.person.tier) >= 0) return GOV_TABS;
+  return GOV_TABS.filter(function (t) { return t.key !== 'audits'; });
+}
 /* 当前登录人是否可对本单本级审批（与后端分权规则一致，用于角标与按钮禁用） */
 function reimbActionable(r) {
   if (!state.person || r.status === '已完成' || r.status === '已驳回') return false;
@@ -2106,9 +2259,11 @@ function reimbWaitTip(r) {
   return '当前状态不可审批';
 }
 async function renderGovernance(c) {
+  const tabs = availableGovTabs();
   /* 支持深链 #/governance/<tab> */
   const sub = (location.hash || '').replace(/^#\/?/, '').split('/')[1];
-  if (sub && GOV_TABS.some(function (t) { return t.key === sub; })) govState.tab = sub;
+  if (sub && tabs.some(function (t) { return t.key === sub; })) govState.tab = sub;
+  if (!tabs.some(function (t) { return t.key === govState.tab; })) govState.tab = tabs[0].key;
   let pendCount = 0;
   try {
     const rl = await api('/api/governance/reimbursements');
@@ -2116,7 +2271,7 @@ async function renderGovernance(c) {
   } catch (e) { /* 角标失败不阻塞页面 */ }
   c.innerHTML = '<div class="data-card !p-0">' +
     '<div class="flex px-4 pt-3 border-b border-gray-100 space-x-1 flex-wrap">' +
-    GOV_TABS.map(function (t) {
+    tabs.map(function (t) {
       return '<div class="zone-tab ' + (govState.tab === t.key ? 'active' : '') + '" onclick="switchGovTab(\'' + t.key + '\')">' + t.name +
         (t.key === 'reimbursements' && pendCount > 0 ? ' <span class="badge bg-danger">' + pendCount + '</span>' : '') + '</div>';
     }).join('') + '</div>' +
@@ -2124,9 +2279,11 @@ async function renderGovernance(c) {
   await loadGovTab();
 }
 async function switchGovTab(tab) {
+  const tabs = availableGovTabs();
+  if (!tabs.some(function (t) { return t.key === tab; })) return;
   govState.tab = tab;
   document.querySelectorAll('#view-container .zone-tab').forEach(function (el, i) {
-    el.classList.toggle('active', GOV_TABS[i].key === tab);
+    el.classList.toggle('active', tabs[i].key === tab);
   });
   document.getElementById('gov-body').innerHTML = loadingHtml();
   await loadGovTab();
@@ -2142,22 +2299,54 @@ async function loadGovTab() {
   } catch (e) { box.innerHTML = errorHtml(e.message); }
 }
 async function renderIncentives(box) {
-  const list = await api('/api/governance/incentives');
-  let html = '<div class="flex justify-end mb-3"><button class="btn-primary" onclick="openIncentiveModal()">+ 申报激励</button></div>';
+  const result = await Promise.all([
+    api('/api/governance/incentives'),
+    api('/api/governance/incentives/summary'),
+  ]);
+  const list = result[0], summary = result[1];
+  let html = '<div class="grid grid-cols-3 gap-3 mb-3">' +
+    '<div class="bg-gray-50 rounded-lg p-3"><div class="text-xs text-gray-500">年度激励池</div><div class="text-xl font-black text-primary">¥' + fmtNum(summary.pool) + '</div></div>' +
+    '<div class="bg-gray-50 rounded-lg p-3"><div class="text-xs text-gray-500">已申报/占用</div><div class="text-xl font-black text-accent">¥' + fmtNum(summary.committed) + '</div></div>' +
+    '<div class="' + (summary.over_budget ? 'bg-red-50' : 'bg-green-50') + ' rounded-lg p-3"><div class="text-xs text-gray-500">可用余量</div><div class="text-xl font-black ' +
+      (summary.over_budget ? 'text-danger' : 'text-success') + '">¥' + fmtNum(summary.remaining) + '</div></div></div>' +
+    '<div class="flex justify-end mb-3"><button class="btn-primary" onclick="openIncentiveModal()">+ 申报激励</button></div>';
   if (!list.length) html += emptyHtml('暂无激励申报');
   else {
     html += '<div class="overflow-x-auto"><table class="gov-table w-full"><thead><tr>' +
-      '<th>奖项</th><th>申报人/候选人</th><th>理由</th><th>金额</th><th>状态</th><th>时间</th></tr></thead><tbody>' +
+      '<th>奖项</th><th>申报人/候选人</th><th>理由</th><th>金额</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>' +
       list.map(function (x) {
         return '<tr><td><span class="badge ' + (INCENTIVE_META[x.type] || 'bg-gray-400') + '">' + esc(x.type) + '</span></td>' +
           '<td class="whitespace-nowrap font-medium">' + esc(x.nominee) + '</td>' +
           '<td class="max-w-md">' + esc(x.reason || '-') + '</td>' +
           '<td class="whitespace-nowrap font-bold text-accent">¥' + fmtNum(x.amount) + '</td>' +
-          '<td>' + statusBadge(x.status, { '申报中': 'bg-accent', '已发放': 'bg-success', '已驳回': 'bg-danger' }) + '</td>' +
-          '<td class="whitespace-nowrap">' + fmtTime(x.created_at) + '</td></tr>';
+          '<td>' + statusBadge(x.status, { '申报中': 'bg-accent', '已评定': 'bg-secondary', '已发放': 'bg-success', '已驳回': 'bg-danger' }) +
+            (x.review_comment ? '<div class="text-xs text-gray-400 mt-1">' + esc(x.review_comment) + '</div>' : '') + '</td>' +
+          '<td class="whitespace-nowrap">' + fmtTime(x.created_at) + '</td>' +
+          '<td class="whitespace-nowrap">' + incentiveActions(x) + '</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   box.innerHTML = html;
+}
+function incentiveActions(x) {
+  if (!state.person || ['boss', 'coach'].indexOf(state.person.tier) < 0) return '<span class="text-gray-300">—</span>';
+  if (x.status === '申报中') {
+    return '<button class="btn-success-sm" onclick="reviewIncentive(' + x.id + ',\'approve\')">评定</button> ' +
+      '<button class="btn-danger-sm" onclick="reviewIncentive(' + x.id + ',\'reject\')">驳回</button>';
+  }
+  if (x.status === '已评定') {
+    return '<button class="btn-success-sm" onclick="reviewIncentive(' + x.id + ',\'release\')">确认发放</button>';
+  }
+  return '<span class="text-gray-300">—</span>';
+}
+async function reviewIncentive(id, action) {
+  const labels = { approve: '评定通过', reject: '驳回', release: '确认发放' };
+  const comment = window.prompt((labels[action] || action) + '，请输入意见（可留空）', '') ;
+  if (comment === null) return;
+  try {
+    await postApi('/api/governance/incentives/' + id + '/review', { action: action, comment: comment });
+    toast(labels[action] + '成功');
+    renderIncentives(document.getElementById('gov-body'));
+  } catch (e) { toast(e.message, 'error'); }
 }
 function updateIncentiveTierHint() {
   const sel = document.getElementById('ni-type');
@@ -2282,7 +2471,9 @@ function submitReimbReject(id) {
 async function renderAudits(box) {
   const list = await api('/api/governance/audits');
   if (!list.length) { box.innerHTML = emptyHtml('暂无审计日志'); return; }
-  box.innerHTML = '<div class="overflow-x-auto max-h-[60vh] overflow-y-auto"><table class="gov-table w-full"><thead><tr>' +
+  box.innerHTML = (canAdmin()
+    ? '<div class="flex justify-end mb-3"><button class="btn-ghost" onclick="downloadAuditCsv()">导出 CSV</button></div>'
+    : '') + '<div class="overflow-x-auto max-h-[60vh] overflow-y-auto"><table class="gov-table w-full"><thead><tr>' +
     '<th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody>' +
     list.map(function (a) {
       return '<tr><td class="whitespace-nowrap">' + fmtTime(a.created_at) + '</td>' +
@@ -2291,6 +2482,19 @@ async function renderAudits(box) {
         '<td class="whitespace-nowrap">' + esc(a.target || '-') + '</td>' +
         '<td class="max-w-md text-xs text-gray-500">' + esc(a.detail || '-') + '</td></tr>';
     }).join('') + '</tbody></table></div>';
+}
+async function downloadAuditCsv() {
+  try {
+    const res = await fetch('/api/governance/audits/export', {
+      headers: { Authorization: 'Bearer ' + state.token }
+    });
+    if (!res.ok) throw new Error('导出失败（HTTP ' + res.status + '）');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'rongqi-audits.csv'; a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { toast(e.message, 'error'); }
 }
 async function renderRedlines(box) {
   const list = await api('/api/governance/redlines');
@@ -2668,6 +2872,19 @@ function toggleFlowHighlight(v) {
 }
 
 /* ==================== 初始化 ==================== */
+async function exchangeImLoginCode(code) {
+  try {
+    const r = await postApi('/api/auth/oauth/session', { code: code });
+    acceptSession(r);
+    history.replaceState(null, '', location.pathname + location.hash);
+    toast('IM 身份验证成功，欢迎 ' + r.person.name);
+    enterApp();
+  } catch (e) {
+    history.replaceState(null, '', location.pathname);
+    toast(e.message, 'error');
+    bootLogin();
+  }
+}
 window.addEventListener('DOMContentLoaded', function () {
   buildSidebar();
   document.getElementById('btn-heartbeat').addEventListener('click', runHeartbeat);
@@ -2680,8 +2897,12 @@ window.addEventListener('DOMContentLoaded', function () {
     charts.forEach(function (c) { try { c.resize(); } catch (e) {} });
   });
   // 一键体验：URL 带 ?person=<id> 时自动以该身份登录（便于演示与验收测试直达内页）
-  const urlPerson = new URLSearchParams(location.search).get('person');
-  if (urlPerson) {
+  const urlParams = new URLSearchParams(location.search);
+  const imCode = urlParams.get('im_login');
+  const urlPerson = urlParams.get('person');
+  if (imCode) {
+    exchangeImLoginCode(imCode);
+  } else if (urlPerson) {
     history.replaceState(null, '', location.pathname + location.hash);
     doLogin(Number(urlPerson));
   } else if (state.token && state.person) enterApp();

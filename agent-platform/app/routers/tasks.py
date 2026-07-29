@@ -7,6 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from app import engine
+from app.access import can_access_task, require_task, require_workspace
 from app.routers.auth import audit, db_conn, get_current_person
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -60,12 +61,13 @@ def list_tasks(status: str = None, agent_id: int = None, reviewer_id: int = None
     if cond:
         sql += " WHERE " + " AND ".join(cond)
     sql += " ORDER BY t.id DESC"
-    return [_view(r) for r in conn.execute(sql, args)]
+    return [_view(r) for r in conn.execute(sql, args) if can_access_task(conn, r, person)]
 
 
 @router.get("/{tid}")
 def get_task(tid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
     """按 ID 读取单项任务，供外部 Agent 运行时使用。"""
+    require_task(conn, tid, person)
     return _detail(conn, tid)
 
 
@@ -80,16 +82,24 @@ def create_task(body: dict = Body(...), conn=Depends(db_conn), person=Depends(ge
     if not title:
         raise HTTPException(400, "title 必填")
     agent_id = body.get("agent_id")
+    workspace_id = body.get("workspace_id")
+    if workspace_id:
+        require_workspace(conn, workspace_id, person)
     agent = None
     if agent_id:
         agent = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
         if not agent:
             raise HTTPException(404, "数字员工不存在")
+        if workspace_id and not conn.execute(
+                "SELECT 1 FROM workspace_members WHERE workspace_id=? "
+                "AND member_type='agent' AND member_id=?",
+                (workspace_id, agent_id)).fetchone():
+            raise HTTPException(422, "该数字员工尚未加入此工作区，请先由负责人配置成员")
     now = datetime.now().isoformat(timespec="seconds")
     tid = conn.execute(
         "INSERT INTO tasks(workspace_id,title,agent_id,creator_id,reviewer_id,status,priority,"
         "requirement,deadline,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (body.get("workspace_id"), title, agent_id, person["id"],
+        (workspace_id, title, agent_id, person["id"],
          body.get("reviewer_id"), body.get("status", "待处理"), body.get("priority", "中"),
          body.get("requirement", ""), body.get("deadline"), now)).lastrowid
     conn.commit()
@@ -102,15 +112,23 @@ def create_task(body: dict = Body(...), conn=Depends(db_conn), person=Depends(ge
 
     # 立即执行：生成交付物 → 待审核
     requirement = body.get("requirement") or title
-    deliverable = engine.generate_deliverable(conn, agent, requirement)
-    reviewer = engine._pick_reviewer(conn, body.get("workspace_id"), person["id"])
-    conn.execute("UPDATE tasks SET status='待审核', deliverable=?, reviewer_id=? WHERE id=?",
-                 (deliverable, reviewer, tid))
-    if body.get("workspace_id"):
-        engine._add_message(conn, body["workspace_id"], "agent", agent["id"], agent["name"],
+    deliverable, model_info = engine.generate_deliverable(conn, agent, requirement, tid)
+    reviewer = engine._pick_reviewer(conn, workspace_id, person["id"])
+    conn.execute(
+        "UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=?,model_provider=?,"
+        "model_name=?,execution_mode=?,execution_error=?,execution_ms=? WHERE id=?",
+        (deliverable, reviewer, model_info.get("provider"), model_info.get("model"),
+         "template_fallback" if model_info.get("fallback") and model_info.get("provider")
+         else ("template" if model_info.get("fallback") else "llm"),
+         model_info.get("reason") if model_info.get("provider") else None,
+         model_info.get("latency_ms", 0), tid),
+    )
+    if workspace_id:
+        engine._add_message(conn, workspace_id, "agent", agent["id"], agent["name"],
                             "agent", "deliverable", deliverable,
-                            {"task_id": tid, "status": "待审核", "version": 1})
-        engine._add_message(conn, body["workspace_id"], "system", None, "系统", "agent", "approval",
+                            {"task_id": tid, "status": "待审核", "version": 1,
+                             "model_info": model_info})
+        engine._add_message(conn, workspace_id, "system", None, "系统", "agent", "approval",
                             f"任务 #{tid} 交付物已生成，待人工审核"
                             f"（审核人：{engine._person_name(conn, reviewer)}）。")
     conn.commit()
@@ -123,7 +141,7 @@ def external_event(tid: int, body: dict = Body(...), conn=Depends(db_conn),
     """外部执行控制面回传事件；任何交付物都只进入“待审核”。"""
     if person["tier"] not in ("boss", "coach"):
         raise HTTPException(403, "仅高管或教练团身份可回传外部运行时事件")
-    task = _get_task_or_404(conn, tid)
+    task = require_task(conn, tid, person)
     if task["status"] == "已通过":
         raise HTTPException(409, "任务已经人工审核通过，不能再写入外部事件")
     event_type = str(body.get("event_type") or "").strip().lower()
@@ -152,7 +170,8 @@ def external_event(tid: int, body: dict = Body(...), conn=Depends(db_conn),
     payload = {"task_id": tid, "runtime": "external", "source": source,
                "external_event_id": event_id, "metadata": metadata}
     if event_type == "started":
-        conn.execute("UPDATE tasks SET status='进行中',deliverable=NULL,done_at=NULL WHERE id=?",
+        conn.execute("UPDATE tasks SET status='进行中',deliverable=NULL,done_at=NULL,"
+                     "execution_mode='external',execution_error=NULL WHERE id=?",
                      (tid,))
         message = content or f"任务 #{tid} 已进入 {source} 执行队列。"
     elif event_type == "progress":
@@ -170,7 +189,8 @@ def external_event(tid: int, body: dict = Body(...), conn=Depends(db_conn),
             raise HTTPException(400, "deliverable 事件必须包含 content")
         reviewer = task["reviewer_id"] or engine._pick_reviewer(
             conn, task["workspace_id"], task["creator_id"])
-        conn.execute("UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=? WHERE id=?",
+        conn.execute("UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=?,"
+                     "execution_mode='external',execution_error=NULL WHERE id=?",
                      (content, reviewer, tid))
         message = f"{source} 已完成任务 #{tid}，交付物已进入人工审核。"
         if task["workspace_id"]:
@@ -218,11 +238,13 @@ def review_task(tid: int, body: dict = Body(...), conn=Depends(db_conn),
 
     权限：仅 tier ∈ {boss, coach, backbone}，且不能审核自己发起的任务。
     """
-    task = _get_task_or_404(conn, tid)
+    task = require_task(conn, tid, person)
     if person["tier"] not in ("boss", "coach", "backbone"):
         raise HTTPException(403, "当前身份无权审核任务，仅高管/教练团/骨干可审核")
     if task["creator_id"] == person["id"]:
         raise HTTPException(403, "不能审核自己发起的任务")
+    if task["reviewer_id"] and person["id"] != task["reviewer_id"] and person["tier"] != "boss":
+        raise HTTPException(403, f"该任务已指派给 {engine._person_name(conn, task['reviewer_id'])} 审核")
     action = body.get("action")
     comment = body.get("comment", "")
     if action not in ("approve", "reject"):

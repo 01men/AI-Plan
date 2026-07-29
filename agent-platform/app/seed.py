@@ -350,6 +350,20 @@ EXTRA_SCENARIOS = [
     ("品保部", "FMEA辅助编制", "中"), ("品保部", "计量器具台账管理", "低"), ("品保部", "质量月报自动生成", "中"),
 ]
 
+# 方案文档给出的 28 个部门场景容量基线（合计 232）。
+# 文档中的“核心场景 / Skill 清单”并非逐条场景定义，且明确说明颗粒度需由
+# 部门提报滚动完善。系统因此保留已定义的 81 个真实场景，并为未定义配额建立
+# 清晰标识的“待部门提报”储备位，既不伪造业务需求，也能完整承载方案规模。
+SCENARIO_QUOTAS = {
+    "董事办": 2, "总经办": 4, "人力资源部": 20, "流程革新部": 10,
+    "财务部": 10, "审计部": 8, "项目管理部": 8, "行政部": 8,
+    "营销商务部": 4, "市场部": 10, "国际销售部": 10, "国内销售部": 8,
+    "电商部": 4, "营销项目部": 8, "采购部": 10, "生产部": 10,
+    "生管部": 10, "生产技术部": 10, "品管部": 10, "PACK生产科": 4,
+    "研究院": 10, "产品管理部": 10, "研发部": 10, "电动工具产品中心": 4,
+    "小家电产品中心": 4, "测试实验室": 8, "SQE管理部": 8, "品保部": 10,
+}
+
 
 def _default_actions(name):
     return [f"{name}·资料采集与结构化", f"{name}·智能分析与生成", f"{name}·人工确认后归档"]
@@ -537,6 +551,45 @@ def run_seed(conn) -> bool:
                      (actor, action, target, detail, now))
 
     conn.execute("INSERT INTO settings(key,value) VALUES('seeded','1')")
+    conn.commit()
+    return True
+
+
+def run_r5_seed(conn) -> bool:
+    """补齐方案文档 232 个部门场景容量位；幂等，且不覆盖既有场景。"""
+    if conn.execute(
+        "SELECT value FROM settings WHERE key='r5_scenario_inventory_seeded'"
+    ).fetchone():
+        return False
+
+    for dept_name, quota in SCENARIO_QUOTAS.items():
+        dept = conn.execute(
+            "SELECT id FROM departments WHERE name=?", (dept_name,)
+        ).fetchone()
+        if not dept:
+            continue
+        existing = conn.execute(
+            "SELECT COUNT(*) c FROM scenarios WHERE dept_id=?", (dept["id"],)
+        ).fetchone()["c"]
+        agent = conn.execute(
+            "SELECT id FROM agents WHERE dept_id=? ORDER BY id LIMIT 1", (dept["id"],)
+        ).fetchone()
+        for index in range(existing + 1, quota + 1):
+            name = f"{dept_name}·待部门提报场景 {index:02d}"
+            conn.execute(
+                "INSERT INTO scenarios("
+                "dept_id,agent_id,name,description,priority,batch,status,"
+                "expected_benefit,actions) VALUES(?,?,?,?,?,'规划储备','待立项','待核定','[]')",
+                (
+                    dept["id"], agent["id"] if agent else None, name,
+                    "方案容量储备位：场景名称、业务规则、数据口径与验收标准"
+                    "须由所属部门提报并经立项评审确认。",
+                    "低",
+                ),
+            )
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('r5_scenario_inventory_seeded','1')"
+    )
     conn.commit()
     return True
 

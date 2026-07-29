@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from app import flow as flow_engine
+from app.access import can_access_workspace, require_flow
 from app.routers.auth import audit, db_conn, get_current_person
 
 router = APIRouter(prefix="/api/flows", tags=["flows"])
@@ -23,12 +24,14 @@ def list_flows(status: str = None, conn=Depends(db_conn), person=Depends(get_cur
         sql += " WHERE status=?"
         args.append(status)
     sql += " ORDER BY id"
-    return [flow_engine.flow_summary(conn, f) for f in conn.execute(sql, args)]
+    return [flow_engine.flow_summary(conn, f) for f in conn.execute(sql, args)
+            if not f["workspace_id"] or can_access_workspace(conn, f["workspace_id"], person)]
 
 
 @router.get("/{fid}")
 def flow_detail(fid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
     """流程完整详情：flow 信息 + 40 节点（全部字段）+ 4 门禁记录 + 主链路序列"""
+    require_flow(conn, fid, person)
     f = _get_flow_or_404(conn, fid)
     return flow_engine.flow_detail(conn, f)
 
@@ -36,6 +39,9 @@ def flow_detail(fid: int, conn=Depends(db_conn), person=Depends(get_current_pers
 @router.post("/{fid}/tick")
 def tick_flow(fid: int, conn=Depends(db_conn), person=Depends(get_current_person)):
     """手动触发一次自动推进（演示/调试用；heartbeat 也会自动调用）"""
+    require_flow(conn, fid, person)
+    if person["tier"] not in ("boss", "coach"):
+        raise HTTPException(403, "仅高管或教练团可手动推进项目流程")
     _get_flow_or_404(conn, fid)
     result = flow_engine.tick(conn, fid)
     if not result.get("ok"):
@@ -51,6 +57,7 @@ def confirm_node(fid: int, code: str, body: dict = Body(default={}),
     """🤝节点确认生效 / 👤节点标记完成。权限：tier ∈ {boss, coach, backbone}"""
     if person["tier"] not in flow_engine.CONFIRM_TIERS:
         raise HTTPException(403, "仅 boss/coach/backbone 可确认流程节点")
+    require_flow(conn, fid, person)
     f = _get_flow_or_404(conn, fid)
     node, err = flow_engine.confirm_node(conn, f, code.upper(), person,
                                          (body.get("comment") or "").strip())
@@ -71,6 +78,7 @@ def sign_gate(fid: int, gate: str, body: dict = Body(default={}),
     if person["tier"] not in flow_engine.GATE_SIGN_TIERS[gate]:
         need = "/".join(sorted(flow_engine.GATE_SIGN_TIERS[gate]))
         raise HTTPException(403, f"{gate} 签核权限不足（要求 tier ∈ {{{need}}}）")
+    require_flow(conn, fid, person)
     f = _get_flow_or_404(conn, fid)
     rec, err = flow_engine.sign_gate(conn, f, gate, person, (body.get("comment") or "").strip())
     if err:

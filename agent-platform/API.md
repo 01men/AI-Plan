@@ -3,7 +3,9 @@
 - Base URL：`http://127.0.0.1:8000`
 - 启动：`python -m uvicorn app.main:app --port 8000`（首次启动自动建库 `data/platform.db` 并播种）
 - 全部接口返回 JSON；错误格式统一为 `{"detail": "错误信息"}`（HTTP 状态码 400/401/404 等）
-- 认证：除 `POST /api/login` 外，所有接口都需要请求头 `Authorization: Bearer <token>`
+- 认证：业务接口需要 `Authorization: Bearer <token>`；公开入口仅包括登录、健康检查、
+  登录人员最小清单、IM 可用状态、IM 登录授权/回调/轮询与同源二维码。
+- 会话有效期 12 小时；`POST /api/logout` 会立即撤销当前 token。
 - 写操作（POST/PATCH/审核/审批）均会写入 `audits` 审计表（`POST /api/login` 除外：登录是高频流水，不记审计）
 - 中文乱码提示：curl 直接 `-d` 内联中文在 Windows Git Bash 下会损坏编码，请用 `--data-binary @file.json`
   并加 `Content-Type: application/json; charset=utf-8`（前端 fetch/axios 无此问题）
@@ -54,6 +56,12 @@
 
 ### GET /api/me
 返回当前登录人（结构同 login 的 `person`）。无/错 token → 401 `{"detail":"Token 无效或已过期"}`。
+
+### POST /api/logout
+撤销当前 Bearer token，响应 `{"ok":true}`。
+
+### GET /api/login/people
+登录选择器公开的在职人员最小展示字段；不返回凭证、手机号等敏感字段。
 
 ---
 
@@ -110,8 +118,7 @@
 
 权限与校验（第一轮验收新增）：
 - 仅 `boss` / `coach` 或该数字员工的 **owner 本人** 可修改，否则 403 `{"detail":"仅高管/教练团或该数字员工的负责人本人可修改"}`；
-- `status` 仅允许 `规划中/开发中/试运行/已上线/已下线`，其他值 422
-  `{"detail":"status 仅允许：规划中/开发中/试运行/已上线/已下线，收到「飞」"}`。
+- `status` 仅允许 `规划中/开发中/试运行/试点中/已上线/已下线`，其他值 422。
 
 请求：
 ```json
@@ -304,7 +311,8 @@
 
 ### POST /api/skills
 请求：`{"name": "信用证审单", "scope": "组织", "category": "外贸", "description": "..."}`
-（`owner_name` 缺省取当前人）。响应：创建的 skill 对象。
+（`owner_name` 缺省取当前人）。仅 boss/coach 可维护；`scope` 仅允许
+`公开/组织/个人`。响应：创建的 skill 对象。
 
 ---
 
@@ -542,7 +550,8 @@ signed_at/comment）、`critical_chain`（主链路 12 节点序列）、`stage_
 ### 13.1 模型供应商配置（R4-1）
 
 引擎生成交付物时的模型解析优先级：旧 `settings.llm_*` 三键（向后兼容）> `agents.model_key`
-绑定的供应商 > `settings.default_model_key`（默认 glm）。供应商停用或未配置 api_key 时静默回落模板。
+绑定的供应商 > `settings.default_model_key`（默认 glm）。供应商停用或未配置 api_key 时回落模板，
+并在任务和 `llm_calls` 中记录回落原因。
 
 #### GET /api/models
 供应商列表（api_key 脱敏）：
@@ -556,8 +565,14 @@ signed_at/comment）、`critical_chain`（主链路 12 节点序列）、`stage_
 响应：`{"ok": true, "default_model_key": "kimi", "providers": [...]}`。404 供应商不存在。
 
 #### PUT /api/models/{key}
-配置单个供应商（boss/coach），可改 `api_key / default_model / enabled`。
-请求：`{"api_key": "你的Key", "enabled": true}`。响应：更新后对象（api_key 脱敏为 已配置/未配置）。
+配置单个供应商（boss/coach），可改
+`api_key / base_url / default_model / temperature / timeout / enabled`。
+`base_url` 必须为 HTTPS（仅 localhost 允许 HTTP）；Kimi Coding 地址会规范为 `/coding/v1`
+且默认温度 1。API Key 使用 AES-256-GCM 加密落库，响应始终脱敏。
+
+#### POST /api/models/{key}/test
+以当前配置请求供应商 `/models`，返回 `{ok,provider,latency_ms,models_count}`；
+失败返回脱敏后的中文错误并记录最近测试状态，不返回密钥或上游原始敏感信息。
 
 #### agents 补充
 `POST /api/agents` 与 `PATCH /api/agents/{id}` 均支持 `model_key`（空=跟随全局默认）；
@@ -627,21 +642,38 @@ html 类按纯文本段落，表格类每 50 行一块），`documents.summary`=
 配置 `app_id/app_secret/redirect_uri/enabled`（仅 boss/coach；secret 返回脱敏、不落审计明文）。
 
 #### GET /api/auth/oauth/{provider}/url
-生成授权 URL。已配置凭证→平台标准授权地址（钉钉 `login.dingtalk.com/oauth2/auth`，
-飞书 `open.feishu.cn/open-apis/authen/v1/authorize`，state=当前人 id）；
+生成“当前已登录人员绑定账号”的授权 URL。已配置凭证→平台标准授权地址（钉钉
+`login.dingtalk.com/oauth2/auth`，飞书 `open.feishu.cn/open-apis/authen/v1/authorize`）；
+`state` 为不可预测、限时、一次性凭证，不包含人员 ID；
 未配置→demo 模式：
 ```json
 {"provider": "dingtalk", "demo": true,
- "url": "/api/auth/oauth/dingtalk/callback?demo=1&person_id=20",
+ "url": "/api/auth/oauth/dingtalk/callback?demo=1&state=<one-time-state>",
  "tip": "未配置钉钉应用凭证，当前为演示模式（配置后自动切换真实授权）"}
 ```
 
-#### GET /api/auth/oauth/{provider}/callback?code=&demo=&person_id=
-授权回调（浏览器直达，免 token）。demo 模式直接模拟外部身份（`钉钉用户_姓名`）完成绑定；
+#### GET /api/auth/oauth/{provider}/callback?code=&demo=&state=
+授权回调（浏览器直达，免 token）。demo 模式消费一次性 state 后模拟绑定；
 真实模式用 code 走 urllib 换 token 换用户信息，任何异常返回中文错误 JSON
 `{"ok": false, "detail": "钉钉授权回调失败：..."}`。成功：
 `{"ok": true, "demo": true, "msg": "...", "binding": {id, person_id, provider, external_id, external_name, bound_at}}`。
 重复绑定按 `UNIQUE(person_id,provider)` 覆盖。
+
+#### GET /api/auth/providers/public
+登录页只读取 `{provider,configured}`，不返回 App ID、回调地址或 Secret。
+
+#### GET /api/auth/oauth/{provider}/login-url
+免平台登录生成真实扫码地址，响应含一次性 `request_id`。回调只按 IM 外部账号查找既有绑定，
+不接收、不信任人员 ID。
+
+#### GET /api/auth/oauth/qr?data=
+同源生成 PNG 二维码，仅允许钉钉、飞书和本机授权域名，避免企业内网依赖公共二维码 CDN。
+
+#### GET /api/auth/oauth/poll?request_id=
+电脑登录页轮询扫码结果；成功后消费一次性结果并签发 12 小时平台会话，token 不进入 URL。
+
+#### POST /api/auth/oauth/session
+用 2 分钟有效、仅可使用一次的短码换取平台会话（兼容回调跳转模式）。
 
 #### GET /api/auth/bindings
 当前人的绑定列表。
@@ -673,7 +705,41 @@ html 类按纯文本段落，表格类每 50 行一块），`documents.summary`=
 
 ---
 
-## 14. 其他
+## 14. R5 终极优化新增契约
+
+### GET /api/health
+免登录健康探针：`{"ok":true,"service":"rongqi-agent-platform","version":"1.5.0"}`。
+
+### GET /api/metrics/people
+人级 AI 成效（boss/coach/backbone）：人员、岗位、层级、部门、创建任务数、已通过数、
+未闭环数与最近活跃时间。普通员工/开发者返回 403。
+
+### GET /api/governance/incentives/summary
+年度激励池：`{pool,committed,remaining,over_budget}`。提交时后端同时做奖项档位和池余量校验。
+
+### POST /api/governance/incentives/{id}/review
+boss/coach 激励闭环：`approve`（申报中→已评定）、`reject`（申报中→已驳回）、
+`release`（已评定→已发放），全程审计。
+
+### GET /api/governance/audits/export
+boss/coach 导出 UTF-8 BOM CSV；对 Excel 公式前缀做转义，普通角色 403。
+
+### R5 任务模型溯源字段
+任务响应新增 `model_provider / model_name / execution_mode / execution_error / execution_ms`。
+`execution_mode` 为 `llm / template / template_fallback / external`；每次调用另写 `llm_calls`
+（供应商、模型、耗时、成败、脱敏错误、回落原因），仅管理者或 Agent 负责人可查看。
+
+### R5 最小权限与资源隐藏
+- boss/coach 全局可见；backbone 可见本人工作区及本部门项目；developer/staff 只见成员工作区；
+- 非成员访问工作区、消息、链路、任务或流程统一 404，避免泄露资源是否存在；
+- L1/L2 知识全员可读，L3 限同部门，L4 限同部门 backbone 及 boss/coach；
+- staff 仅见日常入口和本人治理记录；全局心跳、模型/IM 配置、审计均为服务端强校验。
+
+### R5 场景容量基线
+方案 28 部门配额合计 232。系统保留 81 个已定义场景，并以 `batch=规划储备` 建立
+151 个明确标记的“待部门提报场景”容量位；不伪造业务规则，待部门补齐名称、数据口径与验收标准。
+
+## 15. 其他
 
 ### GET /
 前端入口：`app/static/index.html` 存在则返回该页面，否则返回兜底 JSON

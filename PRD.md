@@ -6,7 +6,7 @@
 - 仓库：https://github.com/01men/AI-Plan （main 分支）
 - 平台代码：`agent-platform/`（Kimi 维护）；Multica 融合：`multica-platform/`（GPT 维护）
 - 运行：双击 `agent-platform/启动平台.bat` → http://127.0.0.1:8000（FastAPI + SQLite + 原生 SPA）
-- 最近更新：2026-07-20（Kimi）
+- 最近更新：2026-07-29（GPT，R5 交付终验）
 
 ---
 
@@ -43,23 +43,37 @@
 | R4-5 | **场景库分类重构**：平台→部门两级分组、推荐排序+🔥徽章、排序切换 | 分组清晰、推荐分生效 | ✅ | Kimi |
 | R4-6 | **执行链路可视化**：Agent 执行区顶部"过去→现在→未来"链路条，CSS 连线，跳完整流程 | 链路数据与流程引擎一致、随消息刷新 | ✅ | Kimi |
 
+### 交付终验（R5 · 2026-07-29 完成）
+
+| # | 能力 | 终验结果 |
+|---|---|---|
+| R5-1 | 服务端最小权限：工作区/任务/消息/流程/知识密级统一授权，越权资源隐藏 | ✅ |
+| R5-2 | 普通员工模式：仅保留协作空间/任务/知识库，桌面与手机端均可直接派活 | ✅ |
+| R5-3 | 真实模型：Kimi Coding 温度/地址兼容、通义与 Kimi 连接测试、任务模型溯源与失败回落提示 | ✅ |
+| R5-4 | 凭证安全：模型 Key/IM Secret AES-256-GCM 加密、会话过期/撤销、一次性 OAuth state/短码 | ✅ |
+| R5-5 | 真实 IM 登录控制面：免登录授权 URL、同源二维码、外部账号绑定查人、轮询换会话 | ✅（真实扫码需客户钉钉管理员现场确认应用回调域名） |
+| R5-6 | 人级成效、激励池余量与评定/发放闭环、审计 CSV 导出、中文 422 | ✅ |
+| R5-7 | 232 场景容量：81 个已定义 + 151 个透明标记的部门待提报储备位 | ✅（储备位业务定义待各部门提报） |
+| R5-8 | 离线可运行：Tailwind/ECharts/二维码脚本本地化，一键启动自动校验依赖 | ✅ |
+| R5-9 | 自动化与角色验收：平台 18/18、运行态 21/21、Multica bridge 5/5、浏览器无 JS 错误 | ✅ |
+
 ### 后续候选（Backlog，认领制）
 
 | # | 需求 | 优先级 | 来源 |
 |---|---|---|---|
-| B-1 | 人级考核数据看板（HR：个人活跃度/产出/覆盖率） | 高 | 验收·李丹 |
-| B-2 | 真实大模型 E2E 联调（Multica CLI 就位后） | 高 | GPT·KIMI_SYNC |
-| B-3 | 钉钉/飞书真实扫码登录：后端需放开免 token 的"按 IM 账号取授权 URL"入口 + 本地客户端登录态识别 | 中 | R4-4 遗留 |
-| B-4 | 422 错误提示全面中文化（pydantic 原文兜底） | 中 | 验收·范丁鑫 |
-| B-5 | 激励池余量展示、审计日志导出 | 低 | 验收·李丹/杨思严 |
-| B-6 | 场景库与方案文档 232 条全量对齐（现 81 条代表性子集） | 中 | V3 分析 |
+| B-1 | 人级考核数据看板（HR：个人活跃度/产出/覆盖率） | 高 | ✅ R5 |
+| B-2 | 真实大模型 E2E 联调 | 高 | ✅ 平台侧 Kimi/通义；Multica 真实 workspace UUID 仍待 CLI 环境 |
+| B-3 | 钉钉/飞书真实扫码登录控制面 | 中 | ✅ R5；客户应用回调域名与首个真实账号绑定待现场确认 |
+| B-4 | 422 错误提示全面中文化（pydantic 原文兜底） | 中 | ✅ R5 |
+| B-5 | 激励池余量展示、审计日志导出 | 低 | ✅ R5 |
+| B-6 | 场景库与方案文档 232 容量对齐 | 中 | ✅ 数量/部门配额；151 储备位业务定义待部门提报 |
 
 ## 三、R4 技术设计约定（开发前必读）
 
-1. **模型配置**：表 `model_providers(key, name, base_url, default_model, api_key, enabled)`，内置 GLM（open.bigmodel.cn）/Kimi（api.moonshot.cn）/MiniMax（api.minimaxi.com）/DeepSeek/通义千问，均为 OpenAI 兼容接口；`agents.model_key` 为空时跟随 `settings.default_model_key`；引擎每次生成实时解析，异常静默回落模板（不联网、零成本演示原则不变）。
+1. **模型配置**：表 `model_providers(key, name, base_url, default_model, api_key, enabled)`，内置 GLM/Kimi/MiniMax/DeepSeek/通义千问；`agents.model_key` 为空时跟随全局默认。R5 起异常回落模板但必须在任务和调用记录中明确留痕。
 2. **MCP**：表 `mcp_servers(id,name,endpoint,description,status)`，agents 侧 JSON 数组绑定；本迭代只做台账绑定与展示，不做真实 MCP 调用。
 3. **知识上传**：`POST /api/knowledge/spaces/{id}/upload`（multipart）；转换：txt/md/docx/pdf→.md（pdf 走系统 pdftotext，docx 走 zipfile+XML 提取），csv/json→SQLite（`data/knowledge/`），html/htm→清洗后 .html；产物存 `data/uploads/`；`doc_chunks` 表按标题/段落拆分（≈500 字/块）+ 摘要。
-4. **IM 绑定**：`auth_providers` + `user_bindings` 表；授权 URL 按钉钉/飞书标准 OAuth 拼接；二维码用前端 CDN 库生成；无凭证走演示模式（回调模拟用户绑定）；token/secret 不落日志不入库展示。
+4. **IM 绑定**：`auth_providers` + `user_bindings` 表；授权 URL 按钉钉/飞书标准 OAuth 拼接；R5 起二维码由同源后端生成，一次性 state/短码换会话；Secret 加密落库且不出现在日志和接口响应中。
 5. **场景推荐分**：`score = 优先级权重(高3/中2/低1) + 预期收益归一化 + 首批试点加成(2)`，降序排列。
 6. **执行链路**：`GET /api/workspaces/{id}/chain` 聚合消息/任务历史与 project_flows 后续节点；前端横向链路条（✅完成/🔵进行中/⚪未来），CSS 连线。
 
@@ -69,3 +83,4 @@
 - 2026-07-20 GPT：Multica 桥接器 + 外部运行时契约端点
 - 2026-07-20 Kimi：项目流程引擎（V3 泳道 N01-N40 + G1-G4）
 - 2026-07-20 Kimi：R4 六项迭代启动（本 PRD 建档）
+- 2026-07-29 GPT：R5 终极优化、真实配置联调、三角色浏览器终验与干净交付库完成

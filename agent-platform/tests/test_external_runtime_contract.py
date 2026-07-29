@@ -16,7 +16,9 @@ class ExternalRuntimeContractTests(unittest.TestCase):
         self.developer = dict(self.conn.execute("SELECT * FROM people WHERE id=20").fetchone())
         self.coach = dict(self.conn.execute("SELECT * FROM people WHERE id=2").fetchone())
         self.agent_id = self.conn.execute(
-            "SELECT id FROM agents ORDER BY id LIMIT 1").fetchone()["id"]
+            "SELECT member_id FROM workspace_members "
+            "WHERE workspace_id=2 AND member_type='agent' ORDER BY member_id LIMIT 1"
+        ).fetchone()["member_id"]
 
     def tearDown(self):
         self.conn.close()

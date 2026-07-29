@@ -5,13 +5,19 @@
 - secret/token 不落日志、返回时脱敏
 """
 import json
+import io
 import urllib.parse
 import urllib.request
 from datetime import datetime
 
+import qrcode
 from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
-from app.routers.auth import audit, db_conn, get_current_person
+from app import crypto
+from app.routers.auth import audit, db_conn, get_current_person, issue_session
+from app.security import (consume_login_code, consume_oauth_state, create_login_code,
+                          create_oauth_state, public_error)
 
 router = APIRouter(prefix="/api/auth", tags=["im-bind"])
 
@@ -70,7 +76,22 @@ def _bind(conn, person_id, provider, external_id, external_name, actor):
 @router.get("/providers")
 def list_providers(conn=Depends(db_conn), person=Depends(get_current_person)):
     """授权配置列表（app_secret 脱敏）"""
-    return [_provider_view(r) for r in conn.execute("SELECT * FROM auth_providers ORDER BY id")]
+    admin = person["tier"] in ("boss", "coach")
+    out = []
+    for row in conn.execute("SELECT * FROM auth_providers ORDER BY id"):
+        item = _provider_view(row)
+        if not admin:
+            item["app_id"] = ""
+            item["redirect_uri"] = ""
+        out.append(item)
+    return out
+
+
+@router.get("/providers/public")
+def public_providers(conn=Depends(db_conn)):
+    """登录页仅获取可用状态，不暴露 App ID、回调地址或 Secret。"""
+    return [{"provider": r["provider"], "configured": _configured(r)}
+            for r in conn.execute("SELECT * FROM auth_providers ORDER BY id")]
 
 
 @router.put("/providers/{provider}")
@@ -86,8 +107,11 @@ def update_provider(provider: str, body: dict = Body(...), conn=Depends(db_conn)
     sets, args = [], []
     for k in ("app_id", "app_secret", "redirect_uri"):
         if k in body:
+            v = (body.get(k) or "").strip()
+            if k == "app_secret":
+                v = crypto.encrypt(v) if v else ""  # R5：secret 加密落库
             sets.append(f"{k}=?")
-            args.append((body.get(k) or "").strip())
+            args.append(v)
     if "enabled" in body:
         sets.append("enabled=?")
         args.append(1 if body.get("enabled") else 0)
@@ -107,6 +131,7 @@ def oauth_url(provider: str, conn=Depends(db_conn), person=Depends(get_current_p
     """生成授权 URL：已配置凭证按平台标准拼接；未配置返回 demo 模式 URL"""
     meta = _check_provider(provider)
     conf = _get_conf(conn, provider)
+    state = create_oauth_state(conn, provider, "bind", person["id"])
     if _configured(conf):
         redirect = conf["redirect_uri"] or \
             f"http://localhost:8000/api/auth/oauth/{provider}/callback"
@@ -114,15 +139,54 @@ def oauth_url(provider: str, conn=Depends(db_conn), person=Depends(get_current_p
             qs = urllib.parse.urlencode({
                 "redirect_uri": redirect, "response_type": "code",
                 "client_id": conf["app_id"], "scope": "openid",
-                "state": str(person["id"]), "prompt": "consent"})
+                "state": state, "prompt": "consent"})
         else:  # feishu
             qs = urllib.parse.urlencode({
                 "app_id": conf["app_id"], "redirect_uri": redirect,
-                "state": str(person["id"])})
+                "state": state})
         return {"provider": provider, "demo": False, "url": f"{meta['authorize']}?{qs}"}
     return {"provider": provider, "demo": True,
-            "url": f"/api/auth/oauth/{provider}/callback?demo=1&person_id={person['id']}",
+            "url": f"/api/auth/oauth/{provider}/callback?demo=1&state={state}",
             "tip": f"未配置{meta['label']}应用凭证，当前为演示模式（配置后自动切换真实授权）"}
+
+
+@router.get("/oauth/{provider}/login-url")
+def oauth_login_url(provider: str, conn=Depends(db_conn)):
+    """免登录生成真实 IM 登录地址；回调按外部账号查既有绑定，不信任人员 ID。"""
+    meta = _check_provider(provider)
+    conf = _get_conf(conn, provider)
+    if not _configured(conf):
+        raise HTTPException(409, f"{meta['label']}真实登录尚未启用，请使用演示身份进入")
+    state = create_oauth_state(conn, provider, "login")
+    redirect = conf["redirect_uri"] or f"http://localhost:8000/api/auth/oauth/{provider}/callback"
+    if provider == "dingtalk":
+        qs = urllib.parse.urlencode({
+            "redirect_uri": redirect, "response_type": "code", "client_id": conf["app_id"],
+            "scope": "openid", "state": state, "prompt": "consent",
+        })
+    else:
+        qs = urllib.parse.urlencode({
+            "app_id": conf["app_id"], "redirect_uri": redirect, "state": state,
+        })
+    return {"provider": provider, "url": f"{meta['authorize']}?{qs}",
+            "request_id": state}
+
+
+@router.get("/oauth/qr")
+def oauth_qr(data: str):
+    """同源生成二维码，避免制造企业内网依赖公共 CDN。"""
+    if len(data or "") > 3000:
+        raise HTTPException(422, "二维码地址过长")
+    parsed = urllib.parse.urlparse(data)
+    allowed = {"login.dingtalk.com", "open.feishu.cn", "localhost", "127.0.0.1"}
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in allowed:
+        raise HTTPException(422, "二维码地址不在允许的授权域名内")
+    image = qrcode.make(data)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png",
+                             headers={"Cache-Control": "no-store"})
 
 
 def _http_json(req):
@@ -131,10 +195,11 @@ def _http_json(req):
 
 
 def _dingtalk_user(conf, code):
-    """钉钉：code 换 userAccessToken 再取用户信息"""
+    """钉钉：code 换 userAccessToken 再取用户信息（app_secret 用时内存解密）"""
     r = _http_json(urllib.request.Request(
         "https://api.dingtalk.com/v1.0/oauth2/userAccessToken",
-        data=json.dumps({"clientId": conf["app_id"], "clientSecret": conf["app_secret"],
+        data=json.dumps({"clientId": conf["app_id"],
+                         "clientSecret": crypto.decrypt(conf["app_secret"]),
                          "code": code, "grantType": "authorization_code"}).encode("utf-8"),
         headers={"Content-Type": "application/json"}))
     token = r.get("accessToken")
@@ -150,7 +215,8 @@ def _feishu_user(conf, code):
     """飞书：先取 tenant_access_token，code 换 user_access_token 再取用户信息"""
     t = _http_json(urllib.request.Request(
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        data=json.dumps({"app_id": conf["app_id"], "app_secret": conf["app_secret"]}).encode("utf-8"),
+        data=json.dumps({"app_id": conf["app_id"],
+                         "app_secret": crypto.decrypt(conf["app_secret"])}).encode("utf-8"),
         headers={"Content-Type": "application/json"}))
     tenant = t.get("tenant_access_token")
     if not tenant:
@@ -172,13 +238,16 @@ def _feishu_user(conf, code):
 @router.get("/oauth/{provider}/callback")
 def oauth_callback(provider: str, code: str = None, demo: str = None,
                    person_id: int = None, state: str = None, conn=Depends(db_conn)):
-    """授权回调（浏览器直达，免 token）：demo 模拟绑定；真实模式 code 换用户，异常返回中文错误 JSON"""
+    """一次性 state 回调：绑定或登录；真实登录返回短期交换码而非在 URL 暴露 Token。"""
     meta = _check_provider(provider)
-    pid = person_id or state
+    state_payload = consume_oauth_state(conn, state or "", provider)
+    # 仅演示环境保留旧 person_id 兼容；真实授权一律要求不可预测、一次性的 state。
+    pid = state_payload.get("person_id") if state_payload else (person_id if demo else None)
+    action = state_payload.get("action") if state_payload else ("bind" if demo else None)
     person = conn.execute("SELECT * FROM people WHERE id=?", (pid or -1,)).fetchone()
-    if not person:
-        return {"ok": False, "detail": "回调失败：未找到对应平台人员（person_id/state 无效）"}
     if demo:
+        if not person:
+            return {"ok": False, "detail": "演示回调失败：人员不存在或 state 已失效"}
         binding = _bind(conn, person["id"], provider,
                         f"demo_{provider}_{person['id']}",
                         f"{meta['label']}用户_{person['name']}", person["name"])
@@ -187,6 +256,8 @@ def oauth_callback(provider: str, code: str = None, demo: str = None,
                 "binding": binding}
     if not code:
         return {"ok": False, "detail": f"{meta['label']}回调缺少 code 参数"}
+    if not state_payload:
+        return {"ok": False, "detail": "授权 state 无效、已过期或已使用，请重新扫码"}
     conf = _get_conf(conn, provider)
     if not _configured(conf):
         return {"ok": False, "detail": f"{meta['label']}应用凭证未配置，无法完成真实授权"}
@@ -196,11 +267,56 @@ def oauth_callback(provider: str, code: str = None, demo: str = None,
         else:
             ext_id, ext_name = _feishu_user(conf, code)
     except Exception as e:
-        return {"ok": False, "detail": f"{meta['label']}授权回调失败：{e}"}
-    binding = _bind(conn, person["id"], provider, ext_id, ext_name, person["name"])
-    return {"ok": True, "demo": False, "provider": provider,
-            "msg": f"已为 {person['name']} 绑定{meta['label']}账号「{ext_name}」",
-            "binding": binding}
+        return {"ok": False, "detail": f"{meta['label']}授权回调失败：{public_error(e)}"}
+    if not ext_id:
+        return {"ok": False, "detail": f"{meta['label']}未返回可识别的账号 ID"}
+    if action == "login":
+        binding = conn.execute(
+            "SELECT * FROM user_bindings WHERE provider=? AND external_id=?",
+            (provider, ext_id),
+        ).fetchone()
+        if not binding:
+            return {"ok": False, "detail": f"该{meta['label']}账号尚未绑定平台人员，请先在平台内完成绑定"}
+        login_code = create_login_code(conn, binding["person_id"], provider)
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
+                     (f"oauth-result:{state}", login_code))
+        conn.commit()
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'><title>授权成功</title>"
+            "<body style='font-family:sans-serif;text-align:center;padding:48px'>"
+            f"<h2>{meta['label']}授权成功</h2><p>请返回电脑上的榕器平台，系统将自动进入。</p></body>"
+        )
+    if not person:
+        return {"ok": False, "detail": "绑定人员不存在"}
+    _bind(conn, person["id"], provider, ext_id, ext_name, person["name"])
+    return RedirectResponse(url=f"/?im_bound={provider}")
+
+
+@router.get("/oauth/poll")
+def poll_oauth_login(request_id: str, conn=Depends(db_conn)):
+    """扫码电脑轮询：拿到一次性结果后立即删除并签发会话。"""
+    if not request_id or len(request_id) > 128:
+        raise HTTPException(422, "授权请求编号格式错误")
+    key = f"oauth-result:{request_id}"
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if not row:
+        return {"ok": True, "pending": True}
+    conn.execute("DELETE FROM settings WHERE key=?", (key,))
+    conn.commit()
+    login_row = consume_login_code(conn, row["value"])
+    if not login_row:
+        raise HTTPException(401, "授权结果已过期，请重新扫码")
+    result = issue_session(conn, login_row["person_id"])
+    return {"ok": True, "pending": False, **result}
+
+
+@router.post("/oauth/session")
+def exchange_oauth_session(body: dict = Body(...), conn=Depends(db_conn)):
+    """浏览器用一次性短码换取 12 小时平台会话。"""
+    row = consume_login_code(conn, str(body.get("code") or ""))
+    if not row:
+        raise HTTPException(401, "IM 登录码无效、已过期或已使用")
+    return issue_session(conn, row["person_id"])
 
 
 @router.get("/bindings")

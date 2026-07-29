@@ -10,6 +10,8 @@ import json
 import urllib.request
 from datetime import datetime, timedelta
 
+from app.security import public_error
+
 J = lambda v: json.dumps(v, ensure_ascii=False)
 
 
@@ -185,49 +187,93 @@ def _agent_actions(conn, agent_id):
 
 
 def _resolve_llm(conn, settings, agent):
-    """解析本次生成应使用的 (base_url, api_key, model)；无可用配置返回 None。
+    """解析本次生成应使用的模型配置 dict；无可用配置返回 None。
     优先级：旧 settings llm_* 三键（向后兼容）> agent.model_key 绑定 > settings.default_model_key。
-    provider 停用或未配置 api_key 时返回 None（回落模板，保持离线原则）。"""
+    provider 停用或未配置 api_key 时返回 None（回落模板，保持离线原则）。
+    api_key 落库为 enc:v1 密文，此处解密后仅用于本次调用。"""
+    from app import crypto
     base, key, model = (settings.get("llm_base_url"), settings.get("llm_api_key"),
                         settings.get("llm_model"))
     if base and key and model:
-        return base, key, model
+        return {"provider": "custom", "base_url": base, "api_key": crypto.decrypt(key),
+                "model": model, "temperature": 0.4, "timeout": 30}
     mk = dict(agent).get("model_key") or settings.get("default_model_key") or "glm"
     row = conn.execute("SELECT * FROM model_providers WHERE key=?", (mk,)).fetchone()
-    if not row or not row["enabled"] or not row["api_key"]:
+    if not row or not row["enabled"] or not (row["api_key"] or "").strip():
         return None
-    return row["base_url"], row["api_key"], row["default_model"]
+    cols = row.keys()
+    temperature = row["temperature"] if "temperature" in cols and row["temperature"] is not None else 0.4
+    # Kimi Coding 的 OpenAI 兼容接口当前只接受 temperature=1。
+    if row["key"] == "kimi" and "api.kimi.com/coding" in (row["base_url"] or ""):
+        temperature = 1.0
+    return {"provider": row["key"], "base_url": row["base_url"],
+            "api_key": crypto.decrypt(row["api_key"]), "model": row["default_model"],
+            "temperature": temperature,
+            "timeout": row["timeout"] if "timeout" in cols and row["timeout"] else 30}
 
 
-def _llm_deliverable(conn, settings, agent, req, actions):
-    """按解析出的模型配置尝试调用 OpenAI 兼容接口；任何异常返回 None 回落模板"""
+def _log_llm_call(conn, task_id, agent_id, provider, model, status,
+                  latency_ms=0, error=None, fallback_reason=None):
+    """模型调用留痕（脱敏：绝不写 api_key）"""
+    conn.execute(
+        "INSERT INTO llm_calls(task_id,agent_id,provider,model,status,latency_ms,error,"
+        "fallback_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (task_id, agent_id, provider, model, status, latency_ms, error, fallback_reason, _now()))
+
+
+def _llm_deliverable(conn, settings, agent, req, actions, task_id=None):
+    """按解析出的模型配置调用 OpenAI 兼容接口。
+
+    返回 (text, model_info)；失败/未配置时 text 为 None 由调用方回落模板。
+    model_info 随交付卡片 payload 下发，前端展示、审核人可追溯。
+    """
+    import time
     resolved = _resolve_llm(conn, settings, agent)
     if not resolved:
-        return None
-    base, key, model = resolved
+        info = {"provider": None, "model": "template", "latency_ms": 0,
+                "fallback": True, "reason": "未配置可用模型，使用模板生成"}
+        return None, info
+    provider, model = resolved["provider"], resolved["model"]
+    timeout = resolved["timeout"]
+    started = time.monotonic()
     try:
         prompt = (f"你是数字员工「{agent['name']}」，类别{agent['category']}。请根据需求生成 300-500 字"
                   f"中文 Markdown 交付物，结构化、可落地。\n需求：{req}\n场景动作：{actions}")
         body = J({"model": model, "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.4}).encode("utf-8")
+                  "temperature": resolved["temperature"]}).encode("utf-8")
         req_http = urllib.request.Request(
-            base.rstrip("/") + "/chat/completions", data=body,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(req_http, timeout=30) as resp:
+            resolved["base_url"].rstrip("/") + "/chat/completions", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {resolved['api_key']}"})
+        with urllib.request.urlopen(req_http, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        return None  # 静默回落模板
+        latency = int((time.monotonic() - started) * 1000)
+        text = data["choices"][0]["message"]["content"]
+        _log_llm_call(conn, task_id, agent["id"], provider, model, "ok", latency)
+        return text, {"provider": provider, "model": model, "latency_ms": latency,
+                      "fallback": False, "reason": None}
+    except Exception as e:
+        latency = int((time.monotonic() - started) * 1000)
+        reason = public_error(e)
+        _log_llm_call(conn, task_id, agent["id"], provider, model, "error", latency,
+                      error=reason, fallback_reason="模型调用失败，回落模板生成")
+        return None, {"provider": provider, "model": model, "latency_ms": latency,
+                      "fallback": True, "reason": reason}
 
 
-def generate_deliverable(conn, agent, req):
-    """生成交付物：优先 LLM（若配置），否则按类别模板"""
+def generate_deliverable(conn, agent, req, task_id=None):
+    """生成交付物：优先 LLM（若配置），否则按类别模板。返回 (text, model_info)"""
     actions = _agent_actions(conn, agent["id"])
-    text = _llm_deliverable(conn, _get_settings(conn), agent, req, actions)
+    text, model_info = _llm_deliverable(conn, _get_settings(conn), agent, req, actions, task_id)
     if text:
-        return text
+        return text, model_info
+    if model_info.get("provider"):
+        # 真实调用失败回落模板时也留一条 template 记录，便于审计区分"未配置"与"失败回落"
+        _log_llm_call(conn, task_id, agent["id"], model_info["provider"], model_info["model"],
+                      "template", model_info.get("latency_ms", 0),
+                      fallback_reason=model_info.get("reason"))
     tpl = TEMPLATES.get(agent["category"], _tpl_general)
-    return tpl(agent, req, actions)
+    return tpl(agent, req, actions), model_info
 
 
 def _pick_reviewer(conn, workspace_id, creator_id):
@@ -276,13 +322,21 @@ def dispatch(conn, workspace_id, agent_id, human_name, requirement_text, creator
         "requirement,deadline,created_at) VALUES(?,?,?,?,?,'进行中','中',?,?,?)",
         (workspace_id, title, agent_id, creator_id, None, requirement_text, deadline, _now())).lastrowid
 
-    deliverable = generate_deliverable(conn, agent, requirement_text)
+    deliverable, model_info = generate_deliverable(conn, agent, requirement_text, task_id)
     reviewer = _pick_reviewer(conn, workspace_id, creator_id)
-    conn.execute("UPDATE tasks SET status='待审核', deliverable=?, reviewer_id=? WHERE id=?",
-                 (deliverable, reviewer, task_id))
+    conn.execute(
+        "UPDATE tasks SET status='待审核',deliverable=?,reviewer_id=?,model_provider=?,"
+        "model_name=?,execution_mode=?,execution_error=?,execution_ms=? WHERE id=?",
+        (deliverable, reviewer, model_info.get("provider"), model_info.get("model"),
+         "template_fallback" if model_info.get("fallback") and model_info.get("provider")
+         else ("template" if model_info.get("fallback") else "llm"),
+         model_info.get("reason") if model_info.get("provider") else None,
+         model_info.get("latency_ms", 0), task_id),
+    )
 
     _add_message(conn, workspace_id, "agent", agent_id, agent["name"], "agent", "deliverable",
-                 deliverable, {"task_id": task_id, "status": "待审核", "version": 1})
+                 deliverable, {"task_id": task_id, "status": "待审核", "version": 1,
+                               "model_info": model_info})
     _add_message(conn, workspace_id, "system", None, "系统", "agent", "approval",
                  f"任务 #{task_id} 交付物已生成，待人工审核（审核人：{_person_name(conn, reviewer)}）。")
     conn.commit()
@@ -306,15 +360,25 @@ def rework(conn, task_id):
         return
     agent = conn.execute("SELECT * FROM agents WHERE id=?", (task["agent_id"],)).fetchone()
     version = _deliverable_version(conn, task_id, task["workspace_id"])
-    deliverable = generate_deliverable(conn, agent, task["requirement"] or task["title"])
+    deliverable, model_info = generate_deliverable(conn, agent, task["requirement"] or task["title"],
+                                                   task_id)
     comment = (task["review_comment"] or "").strip() or "（未填写具体意见）"
     deliverable = (f"第 {version} 版修订说明：针对上一轮驳回意见『{comment}』，"
                    f"本版已逐项修订，请复核。\n\n" + deliverable)
-    conn.execute("UPDATE tasks SET status='待审核', deliverable=? WHERE id=?", (deliverable, task_id))
+    conn.execute(
+        "UPDATE tasks SET status='待审核',deliverable=?,model_provider=?,model_name=?,"
+        "execution_mode=?,execution_error=?,execution_ms=? WHERE id=?",
+        (deliverable, model_info.get("provider"), model_info.get("model"),
+         "template_fallback" if model_info.get("fallback") and model_info.get("provider")
+         else ("template" if model_info.get("fallback") else "llm"),
+         model_info.get("reason") if model_info.get("provider") else None,
+         model_info.get("latency_ms", 0), task_id),
+    )
     if task["workspace_id"]:
         _add_message(conn, task["workspace_id"], "agent", agent["id"], agent["name"], "agent",
                      "deliverable", deliverable,
-                     {"task_id": task_id, "status": "待审核", "rework": True, "version": version})
+                     {"task_id": task_id, "status": "待审核", "rework": True, "version": version,
+                      "model_info": model_info})
         _add_message(conn, task["workspace_id"], "system", None, "系统", "agent", "approval",
                      f"任务 #{task_id} 已按驳回意见重做（第 {version} 版），新交付物待人工审核。")
 
@@ -327,7 +391,6 @@ def _person_name(conn, pid):
 
 
 # ---------------- 私聊区：项目管理智能体需求打磨 ----------------
-
 def _suggest_agents(conn, workspace_id, content):
     """私聊派活建议，返回 (推荐员工名列表, 是否本工作区成员)。
 
@@ -349,12 +412,16 @@ def _suggest_agents(conn, workspace_id, content):
     ]
     for keys, name in rules:
         if any(k in content for k in keys):
-            row = conn.execute("SELECT name FROM agents WHERE name=?", (name,)).fetchone()
+            row = conn.execute(
+                "SELECT name FROM agents WHERE name=? AND status<>'已下线'", (name,)
+            ).fetchone()
             if row:
                 return [row["name"]], False
     row = conn.execute(
-        "SELECT name FROM agents WHERE status='试点中' ORDER BY id LIMIT 1").fetchone()
-    return [row["name"] if row else "外贸跟单数字员工"], False
+        "SELECT name FROM agents WHERE status IN ('已上线','试运行','试点中','开发中') "
+        "ORDER BY CASE status WHEN '已上线' THEN 0 WHEN '试运行' THEN 1 "
+        "WHEN '试点中' THEN 2 ELSE 3 END,id LIMIT 1").fetchone()
+    return ([row["name"]] if row else []), False
 
 
 def private_assist(conn, workspace_id, person, content):
@@ -366,6 +433,10 @@ def private_assist(conn, workspace_id, person, content):
     if not pm:
         return None
     suggested, in_ws = _suggest_agents(conn, workspace_id, content)
+    if not suggested:
+        return _add_message(
+            conn, workspace_id, "system", None, "系统", "private", "text",
+            "当前没有可用数字员工，请联系项目负责人启用或加入数字员工后再派活。")
     brief = content.strip().replace("\n", " ")
     if len(brief) > 60:
         brief = brief[:60] + "…"
@@ -395,6 +466,54 @@ def private_assist(conn, workspace_id, person, content):
 > 以上由项目管理智能体自动整理，确认后可复制示例话术到协作空间直接派活。"""
     return _add_message(conn, workspace_id, "agent", pm["id"], pm["name"],
                         "private", "text", reply)
+
+
+# ---------------- 派活兜底：无可用数字员工时的引导（R5，徐露璐场景） ----------------
+
+def handle_undispatched(conn, workspace_id, person, content):
+    """agent 区发言未触发派发时的兜底：说明原因、推荐在线员工、自动登记待处理需求。
+
+    返回 {"reason", "offline_agents", "suggestions", "pending_task_id"}，
+    同时由项目管理智能体在工作区发一条引导消息（消息在函数内写入，调用方负责 commit）。
+    """
+    offline = [dict(r) for r in conn.execute(
+        "SELECT a.name, p.name owner_name FROM workspace_members wm "
+        "JOIN agents a ON a.id=wm.member_id LEFT JOIN people p ON p.id=a.owner_id "
+        "WHERE wm.workspace_id=? AND wm.member_type='agent' AND a.status='已下线'",
+        (workspace_id,))]
+    has_member = conn.execute(
+        "SELECT 1 FROM workspace_members WHERE workspace_id=? AND member_type='agent' LIMIT 1",
+        (workspace_id,)).fetchone() is not None
+    if offline:
+        names = "、".join(a["name"] for a in offline)
+        owners = "、".join(sorted({a["owner_name"] for a in offline if a["owner_name"]})) or "部门负责人"
+        reason = f"本工作区的数字员工（{names}）已下线，暂时无法承接新任务，可联系负责人（{owners}）或改派其他在线员工。"
+    elif has_member:
+        reason = "本工作区的数字员工当前不可用，请改派其他在线员工或登记待处理需求。"
+    else:
+        reason = "本工作区尚未加入数字员工成员，可从下方推荐中选择在线员工派活，或登记待处理需求由负责人跟进。"
+
+    suggested, in_ws = _suggest_agents(conn, workspace_id, content)
+    # 登记待处理需求任务（无 agent_id，保持「待处理」），保证每条需求都有可追踪去向
+    title = content.strip().lstrip("@")[:40] or "待处理需求"
+    pending_id = conn.execute(
+        "INSERT INTO tasks(workspace_id,title,agent_id,creator_id,reviewer_id,status,priority,"
+        "requirement,created_at) VALUES(?,?,NULL,?,NULL,'待处理','中',?,?)",
+        (workspace_id, f"[待派活] {title}", person["id"], content, _now())).lastrowid
+
+    sug_text = "、".join(f"@{n}" for n in suggested)
+    recommendation = (
+        f"- **推荐在线员工**：{sug_text}（请先由负责人将其加入本工作区）\n"
+        if suggested else "- **当前无在线员工**：请联系项目负责人启用数字员工\n")
+    guide = (f"## 派活引导\n\n{reason}\n\n"
+             f"{recommendation}"
+             f"- **需求已登记**：已为您创建待处理任务 #{pending_id}，负责人可在任务中心认领跟进。\n\n"
+             f"> 以上由项目管理智能体自动生成。")
+    pm = conn.execute("SELECT * FROM agents WHERE name='项目管理智能体'").fetchone()
+    if pm:
+        _add_message(conn, workspace_id, "agent", pm["id"], pm["name"], "agent", "text", guide)
+    return {"reason": reason, "offline_agents": [a["name"] for a in offline],
+            "suggestions": suggested, "pending_task_id": pending_id}
 
 
 # ---------------- 心跳 ----------------

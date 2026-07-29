@@ -122,7 +122,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_comment TEXT,
     deadline TEXT,
     created_at TEXT,
-    done_at TEXT
+    done_at TEXT,
+    model_provider TEXT,
+    model_name TEXT,
+    execution_mode TEXT DEFAULT 'template',
+    execution_error TEXT,
+    execution_ms INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS skills (
@@ -180,6 +185,7 @@ CREATE TABLE IF NOT EXISTS incentives (
     reason TEXT,
     amount REAL,
     status TEXT DEFAULT '申报中',   -- 申报中/已评定/已发放
+    review_comment TEXT,
     created_at TEXT
 );
 
@@ -257,7 +263,12 @@ CREATE TABLE IF NOT EXISTS model_providers (
     base_url TEXT,
     default_model TEXT,
     api_key TEXT DEFAULT '',
-    enabled INTEGER DEFAULT 1
+    enabled INTEGER DEFAULT 1,
+    temperature REAL DEFAULT 0.4,
+    timeout INTEGER DEFAULT 30,
+    last_test_status TEXT DEFAULT '未测试',
+    last_test_message TEXT DEFAULT '',
+    last_tested_at TEXT
 );
 
 -- R4-2 MCP 服务台账（本迭代只做绑定与展示，不做真实调用）
@@ -297,6 +308,31 @@ CREATE TABLE IF NOT EXISTS user_bindings (
     bound_at TEXT,
     UNIQUE(person_id, provider)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_user_binding_external
+ON user_bindings(provider, external_id) WHERE external_id<>'';
+
+CREATE TABLE IF NOT EXISTS oauth_login_codes (
+    code TEXT PRIMARY KEY,
+    person_id INTEGER NOT NULL REFERENCES people(id),
+    provider TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+);
+
+-- R5 模型调用留痕：供应商/模型/耗时/成败/回退原因，供审核人追溯交付物来源
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    agent_id INTEGER,
+    provider TEXT,                     -- 供应商 key（glm/kimi/...），模板生成时为 NULL
+    model TEXT,
+    status TEXT NOT NULL,              -- ok / error / template
+    latency_ms INTEGER DEFAULT 0,
+    error TEXT,                        -- 失败原因（脱敏，不含密钥）
+    fallback_reason TEXT,              -- 回落模板原因
+    created_at TEXT
+);
 """
 
 # 老库增量迁移：逐条尝试，已存在则忽略（sqlite 不支持 IF NOT EXISTS 加列）
@@ -307,6 +343,17 @@ MIGRATIONS = [
     "ALTER TABLE documents ADD COLUMN converted_format TEXT",   # R4-3 md/html/sqlite
     "ALTER TABLE documents ADD COLUMN chunk_count INTEGER DEFAULT 0",
     "ALTER TABLE documents ADD COLUMN summary TEXT",
+    "ALTER TABLE model_providers ADD COLUMN temperature REAL DEFAULT 0.4",  # R5 按供应商可调
+    "ALTER TABLE model_providers ADD COLUMN timeout INTEGER DEFAULT 30",    # R5 调用超时(秒)
+    "ALTER TABLE model_providers ADD COLUMN last_test_status TEXT DEFAULT '未测试'",
+    "ALTER TABLE model_providers ADD COLUMN last_test_message TEXT DEFAULT ''",
+    "ALTER TABLE model_providers ADD COLUMN last_tested_at TEXT",
+    "ALTER TABLE tasks ADD COLUMN model_provider TEXT",
+    "ALTER TABLE tasks ADD COLUMN model_name TEXT",
+    "ALTER TABLE tasks ADD COLUMN execution_mode TEXT DEFAULT 'template'",
+    "ALTER TABLE tasks ADD COLUMN execution_error TEXT",
+    "ALTER TABLE tasks ADD COLUMN execution_ms INTEGER DEFAULT 0",
+    "ALTER TABLE incentives ADD COLUMN review_comment TEXT",
 ]
 
 

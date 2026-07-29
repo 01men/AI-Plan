@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from app.access import can_access_document, require_document
 from app.database import DB_PATH
 from app.routers.auth import audit, db_conn, get_current_person
 
@@ -29,8 +30,10 @@ def list_spaces(conn=Depends(db_conn), person=Depends(get_current_person)):
     out = []
     for r in conn.execute("SELECT * FROM knowledge_spaces ORDER BY id"):
         d = dict(r)
-        d["doc_count"] = conn.execute(
-            "SELECT COUNT(*) c FROM documents WHERE space_id=?", (r["id"],)).fetchone()["c"]
+        docs = conn.execute("SELECT level FROM documents WHERE space_id=?", (r["id"],)).fetchall()
+        d["doc_count"] = sum(
+            1 for doc in docs if can_access_document(person, doc["level"], r["dept_name"])
+        )
         out.append(d)
     return out
 
@@ -38,7 +41,8 @@ def list_spaces(conn=Depends(db_conn), person=Depends(get_current_person)):
 @router.get("/documents")
 def list_documents(space_id: int = None, level: str = None, conn=Depends(db_conn),
                    person=Depends(get_current_person)):
-    sql = "SELECT d.*, s.name space_name FROM documents d JOIN knowledge_spaces s ON s.id=d.space_id"
+    sql = ("SELECT d.*,s.name space_name,s.dept_name space_dept FROM documents d "
+           "JOIN knowledge_spaces s ON s.id=d.space_id")
     cond, args = [], []
     if space_id:
         cond.append("d.space_id=?")
@@ -49,21 +53,30 @@ def list_documents(space_id: int = None, level: str = None, conn=Depends(db_conn
     if cond:
         sql += " WHERE " + " AND ".join(cond)
     sql += " ORDER BY d.id"
-    return [dict(r) for r in conn.execute(sql, args)]
+    return [dict(r) for r in conn.execute(sql, args)
+            if can_access_document(person, r["level"], r["space_dept"])]
 
 
 @router.post("/documents")
 def create_document(body: dict = Body(...), conn=Depends(db_conn),
                     person=Depends(get_current_person)):
+    if person["tier"] not in UPLOAD_TIERS:
+        raise HTTPException(403, "仅业务骨干、教练团、高管或开发者可登记文档")
     title = (body.get("title") or "").strip()
     space_id = body.get("space_id")
     if not title or not space_id:
         raise HTTPException(400, "title 与 space_id 必填")
-    if not conn.execute("SELECT id FROM knowledge_spaces WHERE id=?", (space_id,)).fetchone():
+    space = conn.execute("SELECT * FROM knowledge_spaces WHERE id=?", (space_id,)).fetchone()
+    if not space:
         raise HTTPException(404, "知识空间不存在")
+    level = str(body.get("level", "L1")).upper()
+    if level not in ("L1", "L2", "L3", "L4"):
+        raise HTTPException(422, "密级仅支持 L1/L2/L3/L4")
+    if level == "L4" and person["tier"] not in ("boss", "coach", "backbone"):
+        raise HTTPException(403, "仅高管、教练团或业务骨干可登记 L4 文档")
     did = conn.execute(
         "INSERT INTO documents(space_id,title,level,tags,uploaded_by,created_at) VALUES(?,?,?,?,?,?)",
-        (space_id, title, body.get("level", "L1"), body.get("tags", ""), person["name"],
+        (space_id, title, level, body.get("tags", ""), person["name"],
          datetime.now().isoformat(timespec="seconds"))).lastrowid
     conn.commit()
     audit(conn, person["name"], "上传文档", title, f"空间 #{space_id}")
@@ -276,6 +289,13 @@ async def upload_document(sid: int, file: UploadFile = File(...),
     raw = await file.read()
     if not raw:
         raise HTTPException(422, "文件内容为空")
+    if len(raw) > 25 * 1024 * 1024:
+        raise HTTPException(413, "单个文件不能超过 25MB")
+    level = level.upper()
+    if level not in ("L1", "L2", "L3", "L4"):
+        raise HTTPException(422, "密级仅支持 L1/L2/L3/L4")
+    if level == "L4" and person["tier"] not in ("boss", "coach", "backbone"):
+        raise HTTPException(403, "仅高管、教练团或业务骨干可上传 L4 文档")
 
     work_dir = UPLOAD_ROOT / f"space_{sid}"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -331,11 +351,7 @@ async def upload_document(sid: int, file: UploadFile = File(...),
 
 @router.get("/documents/{did}")
 def get_document(did: int, conn=Depends(db_conn), person=Depends(get_current_person)):
-    row = conn.execute(
-        "SELECT d.*, s.name space_name FROM documents d "
-        "JOIN knowledge_spaces s ON s.id=d.space_id WHERE d.id=?", (did,)).fetchone()
-    if not row:
-        raise HTTPException(404, "文档不存在")
+    row = require_document(conn, did, person)
     d = dict(row)
     d["chunks"] = [dict(r) for r in conn.execute(
         "SELECT id,seq,heading,content FROM doc_chunks WHERE document_id=? ORDER BY seq", (did,))]
@@ -345,9 +361,7 @@ def get_document(did: int, conn=Depends(db_conn), person=Depends(get_current_per
 @router.get("/documents/{did}/file")
 def get_document_file(did: int, conn=Depends(db_conn), person=Depends(get_current_person)):
     """下载/预览转换产物（.md / .html / 表格类的 .md 摘要）"""
-    row = conn.execute("SELECT * FROM documents WHERE id=?", (did,)).fetchone()
-    if not row:
-        raise HTTPException(404, "文档不存在")
+    row = require_document(conn, did, person)
     if not row["file_path"] or not Path(row["file_path"]).exists():
         raise HTTPException(404, "该文档没有可下载的解析产物（可能为台账登记文档）")
     media = "text/html" if row["converted_format"] == "html" else "text/markdown"

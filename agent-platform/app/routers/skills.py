@@ -4,6 +4,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from app.routers.auth import audit, db_conn, get_current_person
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
+SKILL_SCOPES = ("公开", "组织", "个人")
+
+
+def _check_maintainer(person):
+    if person["tier"] not in ("boss", "coach"):
+        raise HTTPException(403, "仅高管/教练团可维护 Skill")
 
 
 @router.get("")
@@ -19,21 +25,20 @@ def list_skills(scope: str = None, conn=Depends(db_conn), person=Depends(get_cur
 
 @router.post("")
 def create_skill(body: dict = Body(...), conn=Depends(db_conn), person=Depends(get_current_person)):
+    _check_maintainer(person)
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "name 必填")
+    scope = body.get("scope", "公开")
+    if scope not in SKILL_SCOPES:
+        raise HTTPException(422, f"scope 仅允许：{'/'.join(SKILL_SCOPES)}")
     sid = conn.execute(
         "INSERT INTO skills(name,scope,category,owner_name,description) VALUES(?,?,?,?,?)",
-        (name, body.get("scope", "公开"), body.get("category", ""),
+        (name, scope, body.get("category", ""),
          body.get("owner_name", person["name"]), body.get("description", ""))).lastrowid
     conn.commit()
     audit(conn, person["name"], "新增Skill", name)
     return dict(conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone())
-
-
-def _check_maintainer(person):
-    if person["tier"] not in ("boss", "coach"):
-        raise HTTPException(403, "仅高管/教练团可维护 Skill")
 
 
 @router.patch("/{sid}")
@@ -44,6 +49,8 @@ def update_skill(sid: int, body: dict = Body(...), conn=Depends(db_conn),
     row = conn.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
     if not row:
         raise HTTPException(404, "Skill 不存在")
+    if "scope" in body and body["scope"] not in SKILL_SCOPES:
+        raise HTTPException(422, f"scope 仅允许：{'/'.join(SKILL_SCOPES)}")
     allowed = ("name", "scope", "category", "owner_name", "description")
     sets, args = [], []
     for k in allowed:
