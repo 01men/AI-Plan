@@ -169,6 +169,7 @@ const ICON = {
   agents: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v3M5 8h14a1 1 0 011 1v9a2 2 0 01-2 2H6a2 2 0 01-2-2V9a1 1 0 011-1zM9 13v2M15 13v2M2 12v4M22 12v4"/>',
   scenarios: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 18h6M10 21h4M12 3a6 6 0 00-3.4 10.9c.8.6 1.4 1.5 1.4 2.5v.6h4v-.6c0-1 .6-1.9 1.4-2.5A6 6 0 0012 3z"/>',
   tasks: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 4h4v16H5zM11 4h4v10h-4zM17 4h4v7h-4z" transform="translate(-1 0)"/>',
+  flows: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5h16v3.5H4zM4 10.25h16v3.5H4zM4 15.5h16V19H4z"/>',
   skills: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13zM4 19.5A2.5 2.5 0 006.5 22H20v-5"/>',
   knowledge: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/>',
   org: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 11a3 3 0 100-6 3 3 0 000 6zM3 20v-1a6 6 0 016-6 6 6 0 016 6v1M17 8a3 3 0 110 6M21 20v-1a5 5 0 00-3.5-4.8"/>',
@@ -181,6 +182,7 @@ const VIEWS = [
   { key: 'agents',     name: '数字员工',   render: renderAgents },
   { key: 'scenarios',  name: '场景库',     render: renderScenarios },
   { key: 'tasks',      name: '任务中心',   render: renderTasks },
+  { key: 'flows',      name: '项目流程',   render: renderFlows },
   { key: 'skills',     name: 'Skill 库',   render: renderSkills },
   { key: 'knowledge',  name: '知识库',     render: renderKnowledge },
   { key: 'org',        name: '组织通讯录', render: renderOrg },
@@ -194,6 +196,7 @@ const VIEW_HINTS = {
   agents:     '你的 AI 同事花名册',
   scenarios:  '想让 AI 干什么活，从这里提',
   tasks:      '数字员工干的活，在这里检查和确认',
+  flows:      '每个场景的落地项目按五阶段推进，智能体自动跑 60% 节点，人类只管 4 道阶段门',
   skills:     '好用的 AI 话术和本领，沉淀在这里大家复用',
   knowledge:  '公司的文件资料柜（NAS）',
   org:        '看看同事和数字员工都在哪个部门',
@@ -930,6 +933,9 @@ async function loadScenarios() {
   if (pr) qs.set('priority', pr);
   try {
     let list = await api('/api/scenarios' + (qs.toString() ? '?' + qs : ''));
+    /* 已立项场景 → 项目流程 id 映射（操作列"流程"跳转按钮用；接口不可用时静默降级） */
+    let flowMap = {};
+    try { (await api('/api/flows')).forEach(function (f) { flowMap[f.scenario_id] = f.id; }); } catch (e) {}
     /* 首批试点置顶 */
     list = list.slice().sort(function (a, b) { return (b.batch === '首批' ? 1 : 0) - (a.batch === '首批' ? 1 : 0); });
     if (!list.length) { box.innerHTML = '<div class="data-card">' + emptyHtml('暂无场景，点击右上角「新建场景」发起申报') + '</div>'; return; }
@@ -946,16 +952,18 @@ async function loadScenarios() {
           '<td class="whitespace-nowrap">' + esc(s.batch || '-') + '</td>' +
           '<td class="whitespace-nowrap">' + esc(s.expected_benefit || '-') + '</td>' +
           '<td>' + statusBadge(s.status, SCENARIO_STATUS_META) + '</td>' +
-          '<td>' + (s.status === '待立项'
+          '<td class="whitespace-nowrap">' + (s.status === '待立项'
             ? '<button class="btn-success-sm" onclick="initiateScenario(' + s.id + ')">敏捷立项</button>'
-            : '<span class="text-xs text-gray-300">—</span>') + '</td></tr>';
+            : (flowMap[s.id]
+              ? '<button class="btn-ghost !py-1 !px-2.5 !text-xs" title="查看该场景的项目流程泳道" onclick="gotoFlow(' + flowMap[s.id] + ')">流程</button>'
+              : '<span class="text-xs text-gray-300">—</span>')) + '</td></tr>';
       }).join('') + '</tbody></table></div>';
   } catch (e) { box.innerHTML = errorHtml(e.message); }
 }
 async function initiateScenario(id) {
   try {
     const r = await postApi('/api/scenarios/' + id + '/initiate');
-    toast('立项成功，已自动创建项目工作区「' + (r.workspace || {}).name + '」');
+    toast('立项成功，已自动创建项目工作区「' + (r.workspace || {}).name + '」' + (r.flow_id ? '，项目流程已生成（见「项目流程」）' : ''));
     wsState.id = (r.workspace || {}).id || null;
     wsState.zone = 'discussion';
     if (location.hash === '#/workspaces') route();
@@ -1559,6 +1567,305 @@ async function renderRoadmap(c) {
     }).join('') + '</tbody></table></div></div>';
   html += '</div>';
   c.innerHTML = html;
+}
+
+/* ==================== 视图：项目流程（N01-N40 五阶段泳道 + G1-G4 阶段门） ==================== */
+const FLOW_ROLE_ORDER = ['PMO', '项目经理', '业务部门', '数字化平台', '财务部', '人力资源部', '流程革新部', '咨询委/决策层'];
+const FLOW_ROLE_LABEL = { '咨询委/决策层': '咨询委·决策层' };
+const FLOW_STAGE_NUM = ['一', '二', '三', '四', '五'];
+const FLOW_STAGE_RANGE = { 1: 'N01-08', 2: 'N09-16', 3: 'N17-24', 4: 'N25-32', 5: 'N33-40' };
+const FLOW_STAGE_FALLBACK = { 1: '项目启动', 2: '方案与设计', 3: '开发与测试', 4: '试点与验证', 5: '结项与移交' };
+const FLOW_EXEC_ICON = { agent: '🤖', hybrid: '🤝', human: '👤' };
+const FLOW_EXEC_NAME = { agent: '智能体自动执行', hybrid: 'AI 起草 · 人工确认', human: '人工执行' };
+const FLOW_NODE_CLS = { '已完成': 'fn-done', '进行中': 'fn-active', '待确认': 'fn-confirm', '待签核': 'fn-sign', '未开始': 'fn-todo', '已锁定': 'fn-locked' };
+const FLOW_NODE_BADGE = { '已完成': 'bg-success', '进行中': 'bg-secondary', '待确认': 'bg-accent', '待签核': 'bg-purple-500', '未开始': 'bg-gray-400', '已锁定': 'bg-gray-500' };
+const FLOW_GATE_DOT = { '已通过': 'gate-done', '待签核': 'gate-pending', '未开启': 'gate-off' };
+const FLOW_GATE_OF_STAGE = { 1: 'G1', 2: 'G2', 4: 'G3', 5: 'G4' };   /* 各阶段收尾门禁（阶段三无门禁） */
+const FLOW_SIGN_TIERS = { G1: ['boss'], G2: ['boss'], G3: ['boss', 'coach', 'backbone'], G4: ['boss'] };
+const FLOW_CONFIRM_TIERS = ['boss', 'coach', 'backbone'];
+const flowState = { id: null, highlight: false, data: null };
+
+function flowStageName(d, s) {
+  const names = d.stage_names || {};
+  return names[String(s)] || FLOW_STAGE_FALLBACK[s] || '';
+}
+function flowHashId() {
+  const m = (location.hash || '').match(/^#\/flows\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+function canConfirmFlow() {
+  return state.person && FLOW_CONFIRM_TIERS.indexOf(state.person.tier) >= 0;
+}
+function canSignGate(gate) {
+  return state.person && (FLOW_SIGN_TIERS[gate] || []).indexOf(state.person.tier) >= 0;
+}
+function flowLockReason(n) {
+  if (n.stage === 4) return '本阶段没有阶段门：等阶段三主链路节点全部完成后自动解锁';
+  const g = FLOW_GATE_OF_STAGE[n.stage - 1];
+  return g ? ('待 ' + g + ' 阶段门通过后解锁') : '待前置阶段完成后解锁';
+}
+/* 场景库/列表卡片统一入口：跳 #/flows/<id> 并选中该流程 */
+function gotoFlow(id) {
+  flowState.id = id;
+  const target = '#/flows/' + id;
+  if (location.hash === target) route();
+  else location.hash = target;   // hashchange 触发路由渲染
+}
+function selectFlow(id) {
+  if (flowState.id === id) return;
+  gotoFlow(id);
+}
+
+async function renderFlows(c) {
+  c.innerHTML = loadingHtml('加载项目流程…');
+  const list = await api('/api/flows');
+  if (!list.length) {
+    c.innerHTML = '<div class="data-card">' + emptyHtml('还没有落地项目：到「场景库」把场景立项后，会自动生成五阶段项目流程') + '</div>';
+    return;
+  }
+  const hashId = flowHashId();
+  if (hashId && list.some(function (f) { return f.id === hashId; })) flowState.id = hashId;
+  if (!flowState.id || !list.some(function (f) { return f.id === flowState.id; })) flowState.id = list[0].id;
+  c.innerHTML = '<div class="flex gap-4 items-start">' +
+    '<div class="w-72 shrink-0 space-y-3">' + list.map(flowCardHtml).join('') + '</div>' +
+    '<div class="flex-1 min-w-0" id="flow-panel">' + loadingHtml('加载流程图…') + '</div></div>';
+  await loadFlowDetail();
+}
+
+function flowCardHtml(f) {
+  const gates = f.gates || {};
+  const dots = ['G1', 'G2', 'G3', 'G4'].map(function (g) {
+    const st = gates[g] || '未开启';
+    return '<span class="flex items-center gap-1" title="阶段门 ' + g + '：' + st + '">' +
+      '<span class="gate-dot ' + (FLOW_GATE_DOT[st] || 'gate-off') + '"></span>' +
+      '<span class="text-[10px] text-gray-400">' + g + '</span></span>';
+  }).join('');
+  return '<div class="data-card !p-3 cursor-pointer card-hover flow-card' + (f.id === flowState.id ? ' flow-card-active' : '') + '" onclick="selectFlow(' + f.id + ')">' +
+    '<div class="flex items-center justify-between gap-2">' +
+      '<div class="font-bold text-sm text-primary truncate" title="' + esc(f.name) + '">' + esc(f.name) + '</div>' +
+      statusBadge(f.status, { '进行中': 'bg-secondary', '已结项': 'bg-success', '已暂停': 'bg-gray-400' }) + '</div>' +
+    '<div class="text-xs text-gray-500 mt-1.5">当前：阶段' + FLOW_STAGE_NUM[(f.current_stage || 1) - 1] + '·' + esc(f.current_stage_name || '') + '</div>' +
+    '<div class="w-full bg-gray-200 rounded-full h-1.5 mt-2"><div class="gradient-accent h-1.5 rounded-full" style="width:' + (f.overall_progress || 0) + '%"></div></div>' +
+    '<div class="text-[11px] text-gray-400 mt-1">总进度 ' + (f.overall_progress || 0) + '% · 节点 ' + f.nodes_done + '/' + f.nodes_total + '</div>' +
+    '<div class="flex items-center justify-between mt-2">' +
+      '<div class="flex items-center gap-2">' + dots + '</div>' +
+      (f.delayed_critical > 0
+        ? '<span class="flex items-center gap-1 text-[11px] text-danger font-semibold"><span class="delay-dot"></span>关键路径延迟 ' + f.delayed_critical + ' 处</span>'
+        : '') +
+    '</div></div>';
+}
+
+async function loadFlowDetail() {
+  const panel = document.getElementById('flow-panel');
+  if (!panel) return;
+  panel.innerHTML = loadingHtml('加载流程图…');
+  try {
+    const d = await api('/api/flows/' + flowState.id);
+    flowState.data = d;
+    panel.innerHTML = flowToolbarHtml(d) + swimlaneHtml(d);
+    /* 深链：#/flows/<fid>/<节点码> 直接打开节点详情抽屉（便于分享与验收截图） */
+    const m = (location.hash || '').match(/^#\/flows\/(\d+)\/([Nn]\d{2})/);
+    if (m && Number(m[1]) === flowState.id) openFlowNode(m[2].toUpperCase());
+  } catch (e) {
+    panel.innerHTML = errorHtml(e.message);
+  }
+}
+
+function stagePct(d, s) {
+  const nodes = d.nodes.filter(function (n) { return n.stage === s; });
+  const done = nodes.filter(function (n) { return n.status === '已完成'; }).length;
+  return { total: nodes.length, done: done, pct: nodes.length ? Math.round(done / nodes.length * 100) : 0 };
+}
+
+/* 顶部工具条：推进流程 + 五段阶段概览 + 关键路径高亮开关 */
+function flowToolbarHtml(d) {
+  const segs = [1, 2, 3, 4, 5].map(function (s) {
+    const p = stagePct(d, s);
+    const cur = d.current_stage === s && d.status === '进行中';
+    return '<div class="flex-1 min-w-[92px]" title="阶段' + FLOW_STAGE_NUM[s - 1] + '·' + esc(flowStageName(d, s)) + '：完成 ' + p.done + '/' + p.total + '">' +
+      '<div class="text-[11px] truncate ' + (cur ? 'text-accent font-bold' : 'text-gray-500') + '">阶段' + FLOW_STAGE_NUM[s - 1] + ' ' + p.pct + '%</div>' +
+      '<div class="bg-gray-200 rounded-full h-1.5 mt-0.5"><div class="' + (p.pct === 100 ? 'bg-success' : 'gradient-accent') + ' h-1.5 rounded-full" style="width:' + p.pct + '%"></div></div></div>';
+  }).join('');
+  return '<div class="data-card !p-3 mb-3 flex items-center gap-4 flex-wrap">' +
+    '<button class="btn-heartbeat" id="btn-flow-tick" onclick="flowTick()"' + (d.status !== '进行中' ? ' disabled' : '') + ' title="让项目管理智能体自动推进一轮（演示用）">▶ 推进流程</button>' +
+    '<div class="flex-1 flex gap-3 min-w-[320px]">' + segs + '</div>' +
+    '<label class="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer select-none shrink-0" title="开启后淡化非关键路径节点">' +
+      '<input type="checkbox" class="accent-orange-500"' + (flowState.highlight ? ' checked' : '') + ' onchange="toggleFlowHighlight(this.checked)">关键路径高亮</label></div>';
+}
+
+function swimlaneHtml(d) {
+  const delayed = d.delayed_nodes || [];
+  let html = '<div class="data-card !p-3 swim-wrap"><div class="swim-grid' + (flowState.highlight ? ' hl-critical' : '') + '" id="swim-grid">';
+  /* 表头：左上角 + 5 个阶段列（带进度） */
+  html += '<div class="swim-head swim-corner">角色 ＼ 阶段</div>';
+  for (let s = 1; s <= 5; s++) {
+    const p = stagePct(d, s);
+    const gate = FLOW_GATE_OF_STAGE[s];
+    const gStatus = gate ? ((d.gates || {})[gate] || '未开启') : null;
+    html += '<div class="swim-head">' +
+      '<div class="flex items-center justify-between gap-1"><span class="font-bold text-primary">阶段' + FLOW_STAGE_NUM[s - 1] + '·' + esc(flowStageName(d, s)) + '</span>' +
+      (gate ? '<span class="badge ' + (gStatus === '已通过' ? 'bg-success' : gStatus === '待签核' ? 'bg-accent' : 'bg-gray-300') + '" title="阶段门 ' + gate + '：' + gStatus + '">⛳' + gate + '</span>' : '') + '</div>' +
+      '<div class="text-[10px] text-gray-400 mt-0.5">' + FLOW_STAGE_RANGE[s] + ' · 完成 ' + p.done + '/' + p.total + '</div>' +
+      '<div class="bg-gray-200 rounded-full h-1 mt-1"><div class="' + (p.pct === 100 ? 'bg-success' : 'bg-secondary') + ' h-1 rounded-full" style="width:' + p.pct + '%"></div></div></div>';
+  }
+  /* 8 行角色 × 5 列阶段 */
+  FLOW_ROLE_ORDER.forEach(function (role) {
+    html += '<div class="swim-role">' + esc(FLOW_ROLE_LABEL[role] || role) + '</div>';
+    for (let s = 1; s <= 5; s++) {
+      const cell = d.nodes.filter(function (n) { return n.role_name === role && n.stage === s; });
+      html += '<div class="swim-cell">' + cell.map(function (n) { return flowNodeCard(n, delayed); }).join('') + '</div>';
+    }
+  });
+  html += '</div>';
+  /* 图例 */
+  html += '<div class="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 text-[11px] text-gray-500">' +
+    '<span>🤖 智能体</span><span>🤝 AI起草·人工确认</span><span>👤 人工</span><span>⛳ 阶段门</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-line"></span>加粗橙边 = 关键路径</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-chip fn-done"></span>已完成</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-chip fn-active"></span>进行中</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-chip fn-confirm"></span>待确认</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-chip fn-sign"></span>待签核</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-chip fn-todo"></span>未开始</span>' +
+    '<span class="flex items-center gap-1"><span class="legend-chip fn-locked"></span>已锁定</span>' +
+    '<span class="flex items-center gap-1"><span class="delay-dot"></span>延迟预警</span></div>';
+  return html + '</div>';
+}
+
+function flowNodeCard(n, delayed) {
+  const cls = FLOW_NODE_CLS[n.status] || 'fn-todo';
+  const isDelay = delayed.indexOf(n.code) >= 0;
+  return '<div class="flow-node ' + cls + (n.is_critical ? ' fn-critical' : '') + '" onclick="openFlowNode(\'' + n.code + '\')"' +
+    ' title="' + esc(n.title + (n.outputs ? '\n产出物：' + n.outputs : '') + '\n点击查看详情') + '">' +
+    (isDelay ? '<span class="fn-delay" title="关键路径延迟预警"></span>' : '') +
+    '<div class="flex items-center gap-1">' +
+      '<span class="font-bold text-[11px] text-primary">' + n.code + '</span>' +
+      '<span>' + (FLOW_EXEC_ICON[n.exec_type] || '') + '</span>' +
+      (n.gate_code ? '<span class="fn-gate-badge">⛳' + n.gate_code + '</span>' : '') +
+      '<span class="flex-1"></span>' +
+      '<span class="fn-status">' + esc(n.status) + '</span></div>' +
+    '<div class="fn-title">' + esc(n.title) + '</div></div>';
+}
+
+function flowRow(label, value) {
+  return '<div class="flex py-1.5 border-b border-gray-100 text-sm"><span class="w-20 shrink-0 text-gray-400 text-xs pt-0.5">' + label + '</span><span class="flex-1 text-gray-700">' + value + '</span></div>';
+}
+
+/* 节点详情抽屉：完整信息 + 按状态/权限给动作 */
+function openFlowNode(code) {
+  const d = flowState.data;
+  if (!d) return;
+  const n = d.nodes.find(function (x) { return x.code === code; });
+  if (!n) return;
+  const gateRec = n.gate_code ? (d.gate_records || []).find(function (g) { return g.gate === n.gate_code; }) : null;
+  let html = '<div class="p-5">' +
+    '<div class="flex items-center justify-between mb-3">' +
+      '<div class="flex items-center gap-2 flex-wrap"><span class="text-lg font-black text-primary">' + n.code + '</span>' +
+      (n.gate_code ? '<span class="fn-gate-badge !text-xs">⛳阶段门 ' + n.gate_code + '</span>' : '') +
+      (n.is_critical ? '<span class="badge bg-accent">关键路径</span>' : '') + '</div>' +
+      '<button onclick="closeDrawer()" class="text-gray-400 hover:text-gray-600 shrink-0" title="关闭">' +
+        '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg></button></div>' +
+    '<div class="font-bold text-gray-800 mb-2">' + esc(n.title) + '</div>' +
+    '<div class="mb-2">' + statusBadge(n.status, FLOW_NODE_BADGE) + '</div>' +
+    flowRow('所属阶段', '阶段' + FLOW_STAGE_NUM[n.stage - 1] + '·' + esc(flowStageName(d, n.stage))) +
+    flowRow('负责角色', esc(FLOW_ROLE_LABEL[n.role_name] || n.role_name)) +
+    flowRow('执行方式', (FLOW_EXEC_ICON[n.exec_type] || '') + ' ' + esc(FLOW_EXEC_NAME[n.exec_type] || n.exec_type)) +
+    flowRow('产出物', esc(n.outputs || '—')) +
+    flowRow('开始时间', fmtTime(n.started_at)) +
+    flowRow('完成时间', fmtTime(n.done_at)) +
+    (n.note ? flowRow('备注', esc(n.note)) : '');
+  if (gateRec) {
+    html += '<div class="mt-3 p-3 rounded-lg bg-purple-50 border border-purple-100 text-xs text-gray-600">' +
+      '<div class="font-bold text-purple-700 mb-1">⛳ 阶段门 ' + gateRec.gate + '（' + esc(gateRec.status) + '）</div>' +
+      (gateRec.signed_by
+        ? '签核人：' + esc(gateRec.signed_by) + ' · ' + fmtTime(gateRec.signed_at) + (gateRec.comment ? '<br>签核意见：' + esc(gateRec.comment) : '')
+        : '尚未签核') + '</div>';
+  }
+  /* 动作区 */
+  html += '<div class="mt-4">';
+  if (n.status === '待确认' && !n.gate_code) {
+    html += canConfirmFlow()
+      ? '<button class="btn-primary w-full" onclick="openNodeConfirmModal(\'' + n.code + '\')">确认生效</button>'
+      : '<div class="text-xs text-gray-500">AI 已起草完成，需骨干及以上同事确认生效。</div>';
+  } else if (n.status === '进行中' && n.exec_type === 'human' && !n.gate_code) {
+    html += canConfirmFlow()
+      ? '<button class="btn-primary w-full" onclick="openNodeConfirmModal(\'' + n.code + '\')">标记完成</button>'
+      : '<div class="text-xs text-gray-500">该节点需人工完成，完成后由骨干及以上同事标记。</div>';
+  } else if (n.status === '待签核' && n.gate_code) {
+    html += canSignGate(n.gate_code)
+      ? '<button class="btn-primary w-full" onclick="openGateSignModal(\'' + n.gate_code + '\')">签核通过</button>'
+      : '<div class="text-xs text-gray-500">' + (n.gate_code === 'G3' ? '需骨干及以上签核（G3 开放教练团/业务骨干）。' : '需决策层签核。') + '</div>';
+  } else if (n.status === '已锁定') {
+    html += '<div class="text-xs text-gray-500">🔒 ' + esc(flowLockReason(n)) + '</div>';
+  } else if (n.status === '已完成') {
+    html += '<div class="text-xs text-success font-semibold">✓ 该节点已完成</div>';
+  } else if (n.status === '未开始') {
+    html += '<div class="text-xs text-gray-500">排队中：点上方「推进流程」可让智能体跑一轮。</div>';
+  }
+  html += '</div></div>';
+  openDrawer(html);
+}
+
+/* 🤝待确认节点确认生效 / 👤进行中节点标记完成（带备注弹窗） */
+function openNodeConfirmModal(code) {
+  const d = flowState.data;
+  const n = d.nodes.find(function (x) { return x.code === code; });
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">' + (n.exec_type === 'hybrid' ? '确认生效' : '标记完成') + ' · ' + code + '</h3>' +
+    '<div class="text-sm text-gray-600 mb-3">' + esc(n.title) + '</div>' +
+    '<label class="form-label">备注（可选，会写进节点记录）</label>' +
+    '<textarea id="fc-comment" class="form-textarea" rows="3" placeholder="如：UAT 反馈已核对，同意生效"></textarea>' +
+    '<div class="flex justify-end space-x-2 mt-4"><button class="btn-ghost" onclick="closeModal()">取消</button>' +
+    '<button class="btn-primary" onclick="submitNodeConfirm(\'' + code + '\')">提交</button></div>');
+}
+async function submitNodeConfirm(code) {
+  const comment = document.getElementById('fc-comment').value.trim();
+  try {
+    await postApi('/api/flows/' + flowState.id + '/nodes/' + code + '/confirm', { comment: comment });
+    closeModal();
+    toast(code + ' 已确认生效');
+    route();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* 阶段门签核弹窗 */
+function openGateSignModal(gate) {
+  openModal('<h3 class="font-bold text-primary text-lg mb-1">阶段门签核 · ' + gate + '</h3>' +
+    '<div class="text-sm text-gray-600 mb-3">签核通过后自动解锁下一阶段，操作会记入审计。</div>' +
+    '<label class="form-label">签核意见（可选）</label>' +
+    '<textarea id="fg-comment" class="form-textarea" rows="3" placeholder="如：同意进入下一阶段"></textarea>' +
+    '<div class="flex justify-end space-x-2 mt-4"><button class="btn-ghost" onclick="closeModal()">取消</button>' +
+    '<button class="btn-primary" onclick="submitGateSign(\'' + gate + '\')">签核通过</button></div>');
+}
+async function submitGateSign(gate) {
+  const comment = document.getElementById('fg-comment').value.trim();
+  try {
+    await postApi('/api/flows/' + flowState.id + '/gates/' + gate + '/sign', { comment: comment });
+    closeModal();
+    toast(gate + ' 签核通过，下一阶段已解锁');
+    route();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* 手动推进一轮（演示用），toast 汇报推进了哪些节点 */
+async function flowTick() {
+  const btn = document.getElementById('btn-flow-tick');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await postApi('/api/flows/' + flowState.id + '/tick');
+    const p = r.processed || [];
+    toast(p.length
+      ? '本轮推进：' + p.map(function (x) { return x.code + (FLOW_EXEC_ICON[x.exec_type] || ''); }).join('、')
+      : '没有可自动推进的节点（等待人工确认或签核）', p.length ? 'success' : 'info');
+    route();
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn) btn.disabled = false;
+  }
+}
+
+function toggleFlowHighlight(v) {
+  flowState.highlight = v;
+  const g = document.getElementById('swim-grid');
+  if (g) g.classList.toggle('hl-critical', v);
 }
 
 /* ==================== 初始化 ==================== */

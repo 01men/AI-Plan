@@ -208,6 +208,46 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- 项目流程引擎（V3 泳道 N01-N40 + 阶段门 G1-G4）
+CREATE TABLE IF NOT EXISTS project_flows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_id INTEGER NOT NULL REFERENCES scenarios(id),
+    workspace_id INTEGER REFERENCES workspaces(id),
+    name TEXT NOT NULL,
+    current_stage INTEGER DEFAULT 1,   -- 1-5
+    status TEXT DEFAULT '进行中',      -- 进行中/已结项/已暂停
+    created_at TEXT,
+    closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS flow_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow_id INTEGER NOT NULL REFERENCES project_flows(id),
+    code TEXT NOT NULL,                -- N01-N40
+    stage INTEGER NOT NULL,            -- 1-5
+    role_name TEXT,                    -- 泳道角色（业务部门/项目经理/数字化平台/...）
+    title TEXT,
+    outputs TEXT,                      -- 产出物（/ 分隔）
+    exec_type TEXT,                    -- agent/hybrid/human
+    is_critical INTEGER DEFAULT 0,     -- 1=主链路节点
+    gate_code TEXT,                    -- 可空：G1-G4（门禁节点）
+    status TEXT DEFAULT '未开始',      -- 已锁定/未开始/进行中/待确认/待签核/已完成
+    started_at TEXT,
+    done_at TEXT,
+    note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gate_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow_id INTEGER NOT NULL REFERENCES project_flows(id),
+    gate TEXT NOT NULL,                -- G1-G4
+    stage INTEGER NOT NULL,            -- 门禁所在阶段（G1=1 G2=2 G3=4 G4=5）
+    status TEXT DEFAULT '未开启',      -- 未开启/待签核/已通过
+    signed_by TEXT,
+    signed_at TEXT,
+    comment TEXT
+);
 """
 
 

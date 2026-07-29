@@ -102,6 +102,11 @@ def initiate_scenario(sid: int, conn=Depends(db_conn), person=Depends(get_curren
         (wid, "human", person["id"], person["name"], "discussion", "text", note, None, now))
     conn.commit()
     audit(conn, person["name"], "场景立项", sc["name"], f"立项并自动创建工作区 #{wid}")
+    # 项目流程引擎：实例化 N01-N40 泳道 + G1-G4 阶段门（老工作区不受影响）
+    from app import flow as flow_engine
+    flow_id = flow_engine.instantiate(conn, sid, wid, sc["name"])
+    conn.commit()
+    audit(conn, person["name"], "流程实例化", f"flow#{flow_id}", f"场景「{sc['name']}」40 节点流程已生成")
     ws = conn.execute("SELECT * FROM workspaces WHERE id=?", (wid,)).fetchone()
     return {"scenario": _view(conn.execute("SELECT * FROM scenarios WHERE id=?", (sid,)).fetchone()),
-            "workspace": dict(ws)}
+            "workspace": dict(ws), "flow_id": flow_id}

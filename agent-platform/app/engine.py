@@ -415,6 +415,25 @@ def heartbeat(conn):
         "WHERE status IN ('待处理','进行中','待审核') AND deadline<=?", (limit,)).fetchall()
 
     due_lines = "\n".join(f"- 任务#{t['id']} {t['title']}（截止 {t['deadline']}）" for t in due) or "- 无"
+
+    # ---- 项目流程巡检：每个进行中 flow 推进一次 tick + 主链路延迟预警 ----
+    from app import flow as flow_engine  # 延迟导入，避免与 flow.py 循环依赖
+    flow_lines, warn_lines = [], []
+    for f in conn.execute("SELECT * FROM project_flows WHERE status='进行中' ORDER BY id").fetchall():
+        flow_engine.tick(conn, f["id"])
+    for f in conn.execute("SELECT * FROM project_flows ORDER BY id").fetchall():
+        s = flow_engine.flow_summary(conn, f)
+        gates_txt = " ".join(f"{g}{'✅' if st == '已通过' else '⏳' if st == '待签核' else '—'}"
+                             for g, st in s["gates"].items())
+        flow_lines.append(f"- {s['name']}：{s['status']}，阶段 {s['current_stage']}/5"
+                          f"（{s['current_stage_name']} {s['stage_progress']}%），"
+                          f"节点完成 {s['nodes_done']}/{s['nodes_total']}，门禁 {gates_txt}")
+    for d in flow_engine.delayed_critical_nodes(conn):
+        warn_lines.append(f"- 关键路径延迟预警：{d['code']}（{d['title']}）已进行 {d['days']} 天"
+                          f"（流程：{d['flow_name']}，状态：{d['status']}）")
+    flow_section = "\n".join(flow_lines) or "- 暂无项目流程"
+    warn_section = "\n".join(warn_lines) or "- 无"
+
     report = f"""## 数字员工运营日报（{today.isoformat()}）
 
 - 昨日完成任务：**{done_yesterday}** 件
@@ -424,10 +443,17 @@ def heartbeat(conn):
 ### 临期任务清单（24h 内）
 {due_lines}
 
-> 以上由项目管理智能体自动汇总，临期任务已触发催办。"""
+### 项目流程进展
+{flow_section}
+
+### 关键路径延迟预警（主链路节点滞留超 {flow_engine.DELAY_DAYS} 天）
+{warn_section}
+
+> 以上由项目管理智能体自动汇总，临期任务已触发催办，项目流程已自动推进一轮。"""
     _add_message(conn, ws["id"], "agent", pm["id"], pm["name"], "agent", "report", report,
                  {"date": today.isoformat(), "done_yesterday": done_yesterday,
-                  "pilot_scenarios": pilot_cnt, "coverage": coverage, "due_tasks": len(due)})
+                  "pilot_scenarios": pilot_cnt, "coverage": coverage, "due_tasks": len(due),
+                  "flow_warnings": len(warn_lines)})
 
     for t in due:
         _add_message(conn, t["workspace_id"], "system", None, "系统", "agent", "text",
@@ -435,4 +461,5 @@ def heartbeat(conn):
     conn.commit()
     return {"ok": True, "date": today.isoformat(), "done_yesterday": done_yesterday,
             "pilot_scenarios": pilot_cnt, "coverage": coverage,
-            "reminded_tasks": len(due), "report_workspace": ws["name"]}
+            "reminded_tasks": len(due), "report_workspace": ws["name"],
+            "flow_warnings": len(warn_lines)}

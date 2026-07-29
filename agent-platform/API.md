@@ -459,10 +459,85 @@
 {"ok": true, "skipped": true, "date": "2026-07-19",
  "reason": "今日日报已发布（消息#33），跳过重复心跳", "report_workspace": "总经办·经营驾驶舱"}
 ```
+心跳同时会对每个进行中流程自动执行一次 tick 巡检，日报中含「项目流程进展」与「关键路径延迟预警」两节。
 
 ---
 
-## 12. 其他
+## 12. 项目流程（N01-N40 泳道 + G1-G4 阶段门）
+
+承载《AI数智化行动方案 V3》：5 阶段 × 8 角色 × 40 节点；🤖agent 24 / 🤝hybrid 9 / 👤human 7；
+12 个主链路节点构成关键路径（N01→N02→N07→G1→N09→G2→N17→N18→N25→G3→N33→G4）；
+阶段门 G1=N08 / G2=N16 / G3=N28 / G4=N40，**未过门禁不得进入下一阶段**（阶段三无门禁，主链路全完成后自动解锁阶段四）。
+场景立项（`POST /api/scenarios/{id}/initiate`）时自动实例化，响应带 `flow_id`；种子数据含 2 个演示流程
+（flow#1 外贸→阶段三、flow#2 会议纪要→G1 待签核）。
+
+| 字段 | 取值 |
+| ---- | ---- |
+| project_flows.status | `进行中` / `已结项` / `已暂停` |
+| project_flows.current_stage | 1-5（项目启动/方案与设计/开发与测试/试点与验证/结项与移交） |
+| flow_nodes.exec_type | `agent`（自动完成）/ `hybrid`（AI 初稿待人确认）/ `human`（人工完成） |
+| flow_nodes.status | `已锁定` / `未开始` / `进行中` / `待确认` / `待签核` / `已完成` |
+| gate_records.status | `未开启` / `待签核` / `已通过` |
+
+### GET /api/flows
+流程列表（可按 `?status=进行中` 过滤）。每行含阶段进度、门禁汇总、延迟主链路节点数。
+
+响应 200（节选）：
+```json
+[
+  {"id": 1, "scenario_id": 1, "workspace_id": 2, "name": "外贸订单跟单自动化",
+   "status": "进行中", "current_stage": 3, "current_stage_name": "开发与测试",
+   "created_at": "2026-07-09T09:00:00", "closed_at": null,
+   "stage_progress": 13, "overall_progress": 40, "nodes_done": 16, "nodes_total": 40,
+   "gates": {"G1": "已通过", "G2": "已通过", "G3": "未开启", "G4": "未开启"},
+   "delayed_critical": 1, "delayed_nodes": ["N17"]}
+]
+```
+
+### GET /api/flows/{id}
+流程完整详情：在列表字段基础上增加 `nodes`（40 节点全部字段：code/stage/role_name/title/outputs/
+exec_type/is_critical/gate_code/status/started_at/done_at/note）、`gate_records`（4 条，含 signed_by/
+signed_at/comment）、`critical_chain`（主链路 12 节点序列）、`stage_names`。
+
+### POST /api/flows/{id}/tick
+手动触发一次自动推进（演示/调试用，需登录，写审计；heartbeat 每轮也会自动调用）。
+规则：按节点顺序处理「未开始」节点，每次最多 2 个——🤖直接置已完成并发产出消息；
+🤝置「待确认」并发"AI 已生成初稿，请 XX 确认生效"；👤（非门禁）置「进行中」并发 @角色 提醒；
+门禁节点不自动处理。
+
+响应 200：
+```json
+{"ok": true, "flow_id": 3, "processed": [{"code": "N03", "exec_type": "agent"}, {"code": "N04", "exec_type": "agent"}]}
+```
+
+### POST /api/flows/{id}/nodes/{code}/confirm
+🤝节点确认生效 / 👤节点标记完成。权限：`tier ∈ {boss, coach, backbone}`（其余 403）。
+前置状态：hybrid 须为「待确认」，human 须为「进行中」；门禁节点请走签核接口（400）。
+确认后置「已完成」（note 记录确认人与 comment）；若为主链路节点且同阶段主链路全部完成，
+门禁节点自动置「待签核」、gate_record 置「待签核」。
+
+请求体（可空）：`{"comment": "预算与ROI无误"}`
+响应 200：`{"ok": true, "node": {...}}`
+错误：403 权限不足；400 状态不符（如「已完成，无需重复确认」）；404 节点不存在。
+
+### POST /api/flows/{id}/gates/{gate}/sign
+阶段门签核（gate ∈ G1-G4）。权限：**G1/G2/G4 仅 boss；G3 允许 boss/coach/backbone**（其余 403）。
+前置：gate_record 须为「待签核」（未开启→400）。签核后：gate_record「已通过」（signed_by/signed_at/comment）、
+门禁节点「已完成」、下一阶段节点「已锁定→未开始」、flow.current_stage+1；
+**G4 通过后 flow.status=「已结项」并写 closed_at，关联 scenario.status 置「已验收」**。
+全程写 audits + 工作区消息。
+
+请求体（可空）：`{"comment": "同意立项，A级"}`
+响应 200：
+```json
+{"ok": true, "gate": {"id": 1, "flow_id": 2, "gate": "G1", "stage": 1, "status": "已通过",
+ "signed_by": "董事长", "signed_at": "2026-07-29T16:00:00", "comment": "同意立项，A级"}}
+```
+错误：403 签核权限不足（报文注明要求 tier）；400 未开启/重复签核；404 阶段门不存在。
+
+---
+
+## 13. 其他
 
 ### GET /
 前端入口：`app/static/index.html` 存在则返回该页面，否则返回兜底 JSON
@@ -479,3 +554,5 @@
 5. `POST /api/workspaces/2/messages` 发 `@外贸跟单数字员工 ...`（zone=agent）实时触发派发；
 6. `POST /api/tasks/{task_id}/review` 审核通过/驳回；
 7. `GET /api/metrics/dashboard` 看 KPI 变化；`POST /api/heartbeat/run` 触发日报。
+8. 项目流程：`GET /api/flows` 看两个演示流程 → `GET /api/flows/1` 看 40 节点泳道 →
+   `POST /api/flows/2/gates/G1/sign`（boss 登录）演示阶段门签核解锁阶段二。

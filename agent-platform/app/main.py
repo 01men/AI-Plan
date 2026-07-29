@@ -9,10 +9,10 @@ from fastapi.staticfiles import StaticFiles
 
 from app import engine
 from app.database import get_db, init_db
-from app.routers import (agents, auth, governance, knowledge, metrics, org,
+from app.routers import (agents, auth, flows, governance, knowledge, metrics, org,
                          roadmap, scenarios, skills, tasks, workspaces)
 from app.routers.auth import audit, db_conn, get_current_person
-from app.seed import run_seed
+from app.seed import run_flow_seed, run_seed
 
 app = FastAPI(title="Agent 人机协作平台", version="1.0.0")
 
@@ -20,7 +20,7 @@ app = FastAPI(title="Agent 人机协作平台", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 for r in (auth, org, agents, scenarios, workspaces, tasks, skills, knowledge,
-          metrics, governance, roadmap):
+          metrics, governance, roadmap, flows):
     app.include_router(r.router)
 
 # 静态目录（前端构建产物放这里）
@@ -67,5 +67,6 @@ async def startup():
     conn = get_db()
     init_db(conn)
     run_seed(conn)  # 内部用 settings.seeded 标记，只跑一次
+    run_flow_seed(conn)  # 流程引擎演示数据，settings.flow_seeded 标记，只跑一次
     conn.close()
     asyncio.create_task(_heartbeat_loop())

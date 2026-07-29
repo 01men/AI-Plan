@@ -539,3 +539,137 @@ def run_seed(conn) -> bool:
     conn.execute("INSERT INTO settings(key,value) VALUES('seeded','1')")
     conn.commit()
     return True
+
+
+# ---------------- 项目流程引擎演示数据（新老库通用，settings.flow_seeded 标记） ----------------
+
+def _fts(days_ago, hour=9, minute=0):
+    """生成历史时间戳（今天零点前 days_ago 天的 hour:minute）"""
+    return (datetime.now() - timedelta(days=days_ago)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0).isoformat(timespec="seconds")
+
+
+def _flow_msg(conn, wid, content, ts):
+    conn.execute(
+        "INSERT INTO messages(workspace_id,sender_type,sender_id,sender_name,zone,msg_type,content,payload,created_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?)",
+        (wid, "system", None, "项目管理智能体", "agent", "text", content, None, ts))
+
+
+def _set_node(conn, fid, code, status, started=None, done=None, note=None):
+    conn.execute(
+        "UPDATE flow_nodes SET status=?, started_at=?, done_at=?, note=? WHERE flow_id=? AND code=?",
+        (status, started, done, note, fid, code))
+
+
+def _set_gate(conn, fid, gate, status, signed_by=None, signed_at=None, comment=None):
+    conn.execute(
+        "UPDATE gate_records SET status=?, signed_by=?, signed_at=?, comment=? WHERE flow_id=? AND gate=?",
+        (status, signed_by, signed_at, comment, fid, gate))
+
+
+def _node_msg(conn, wid, mapping, code, ts, prefix="项目管理智能体已完成 "):
+    t = mapping[code]
+    _flow_msg(conn, wid, f"{prefix}{code}（{t[0]}），产出：{t[1]}。", ts)
+
+
+def _demo_flow_stage3(conn, fid, wid):
+    """外贸订单跟单自动化：推进到阶段三，G1/G2 已签核，N17 待确认（滞留 4 天触发预警）"""
+    from app import flow as fe
+    m = {t[0]: (t[6], t[7], t[2]) for t in fe.FLOW_TEMPLATE}  # code -> (title, outputs, role)
+
+    # 阶段一（D-20 ~ D-15）
+    _set_node(conn, fid, "N01", "已完成", _fts(20, 9, 10), _fts(20, 10), "李乐平确认生效：需求建议书已评审")
+    _flow_msg(conn, wid, "业务部门已完成 N01（提出业务痛点·参与可行性），产出：需求建议书（李乐平确认生效）。", _fts(20, 10))
+    _set_node(conn, fid, "N02", "已完成", _fts(19, 9), _fts(19, 9)); _node_msg(conn, wid, m, "N02", _fts(19, 9))
+    _set_node(conn, fid, "N03", "已完成", _fts(19, 10), _fts(19, 10)); _node_msg(conn, wid, m, "N03", _fts(19, 10))
+    _set_node(conn, fid, "N04", "已完成", _fts(18, 9), _fts(18, 9)); _node_msg(conn, wid, m, "N04", _fts(18, 9))
+    _set_node(conn, fid, "N05", "已完成", _fts(18, 10), _fts(18, 10)); _node_msg(conn, wid, m, "N05", _fts(18, 10))
+    _set_node(conn, fid, "N06", "已完成", _fts(17, 9), _fts(17, 14), "杨思严确认生效")
+    _flow_msg(conn, wid, "AI 已生成 N06 初稿（预算意见/ROI计算），请财务部确认生效。", _fts(17, 9))
+    _flow_msg(conn, wid, "杨思严 已确认 N06（审核预算·ROI测算）生效，产出：预算意见/ROI计算。", _fts(17, 14))
+    _set_node(conn, fid, "N07", "已完成", _fts(16, 9), _fts(16, 15), "马进军确认生效")
+    _flow_msg(conn, wid, "AI 已生成 N07 初稿（立项书/章程/RACI），请PMO确认生效。", _fts(16, 9))
+    _flow_msg(conn, wid, "马进军 已确认 N07（立项发起组织·等级评审·组建团队）生效，产出：立项书/章程/RACI。", _fts(16, 15))
+    _set_node(conn, fid, "N08", "已完成", _fts(16, 15), _fts(15, 10), "董事长签核通过：同意立项，定为A级项目")
+    _flow_msg(conn, wid, "阶段一「项目启动」主链路节点全部完成，阶段门 G1（N08 审批立项·确定等级）已开启，请咨询委/决策层签核。未过门禁不得进入下一阶段。", _fts(16, 15))
+    _set_gate(conn, fid, "G1", "已通过", "董事长", _fts(15, 10), "同意立项，定为A级项目")
+    _flow_msg(conn, wid, "阶段门 G1（N08 审批立项·确定等级）已由 董事长 签核通过：同意立项，定为A级项目。阶段二「方案与设计」已解锁。", _fts(15, 10))
+
+    # 阶段二（D-14 ~ D-10）
+    _set_node(conn, fid, "N09", "已完成", _fts(14, 9), _fts(14, 16), "李乐平确认生效：验收标准已确认")
+    _flow_msg(conn, wid, "AI 已生成 N09 初稿（需求规格/流程清单），请业务部门确认生效。", _fts(14, 9))
+    _flow_msg(conn, wid, "李乐平 已确认 N09（细化需求·评审方案·确认验收标准）生效，产出：需求规格/流程清单。", _fts(14, 16))
+    _set_node(conn, fid, "N10", "已完成", _fts(13, 9), _fts(13, 9)); _node_msg(conn, wid, m, "N10", _fts(13, 9))
+    _set_node(conn, fid, "N11", "已完成", _fts(13, 10), _fts(13, 10)); _node_msg(conn, wid, m, "N11", _fts(13, 10))
+    _set_node(conn, fid, "N12", "已完成", _fts(12, 9), _fts(12, 9)); _node_msg(conn, wid, m, "N12", _fts(12, 9))
+    _set_node(conn, fid, "N13", "已完成", _fts(12, 10), _fts(12, 10)); _node_msg(conn, wid, m, "N13", _fts(12, 10))
+    _set_node(conn, fid, "N14", "已完成", _fts(11, 9), _fts(11, 9)); _node_msg(conn, wid, m, "N14", _fts(11, 9))
+    _set_node(conn, fid, "N15", "已完成", _fts(11, 10), _fts(11, 10)); _node_msg(conn, wid, m, "N15", _fts(11, 10))
+    _set_node(conn, fid, "N16", "已完成", _fts(11, 11), _fts(10, 15), "董事长签核通过：方案评审通过，预算不变")
+    _flow_msg(conn, wid, "阶段二「方案与设计」主链路节点全部完成，阶段门 G2（N16 评审重大方案·批准预算调整）已开启，请咨询委/决策层签核。未过门禁不得进入下一阶段。", _fts(11, 11))
+    _set_gate(conn, fid, "G2", "已通过", "董事长", _fts(10, 15), "方案评审通过，预算不变")
+    _flow_msg(conn, wid, "阶段门 G2（N16 评审重大方案·批准预算调整）已由 董事长 签核通过：方案评审通过，预算不变。阶段三「开发与测试」已解锁。", _fts(10, 15))
+
+    # 阶段三：N17 待确认（滞留 4 天，将在日报中触发关键路径延迟预警），其余节点未开始
+    _set_node(conn, fid, "N17", "待确认", _fts(4, 9), None, None)
+    _flow_msg(conn, wid, "AI 已生成 N17 初稿（数字员工MVP/UAT反馈），请业务部门确认生效。", _fts(4, 9))
+    conn.execute("UPDATE flow_nodes SET status='未开始' WHERE flow_id=? AND stage=3 AND status='已锁定'", (fid,))
+    conn.execute("UPDATE project_flows SET current_stage=3 WHERE id=?", (fid,))
+
+
+def _demo_flow_gate1(conn, fid, wid):
+    """会议纪要与待办闭环：刚到阶段一 G1 待签核（演示签核操作）"""
+    from app import flow as fe
+    m = {t[0]: (t[6], t[7], t[2]) for t in fe.FLOW_TEMPLATE}
+
+    _set_node(conn, fid, "N01", "已完成", _fts(3, 9, 10), _fts(3, 10), "李乐平确认生效：痛点清单已归档")
+    _flow_msg(conn, wid, "业务部门已完成 N01（提出业务痛点·参与可行性），产出：需求建议书（李乐平确认生效）。", _fts(3, 10))
+    _set_node(conn, fid, "N02", "已完成", _fts(2, 9), _fts(2, 9)); _node_msg(conn, wid, m, "N02", _fts(2, 9))
+    _set_node(conn, fid, "N03", "已完成", _fts(2, 10), _fts(2, 10)); _node_msg(conn, wid, m, "N03", _fts(2, 10))
+    _set_node(conn, fid, "N04", "已完成", _fts(2, 14), _fts(2, 14)); _node_msg(conn, wid, m, "N04", _fts(2, 14))
+    _set_node(conn, fid, "N05", "已完成", _fts(2, 15), _fts(2, 15)); _node_msg(conn, wid, m, "N05", _fts(2, 15))
+    _set_node(conn, fid, "N06", "已完成", _fts(1, 9), _fts(1, 10), "杨思严确认生效")
+    _flow_msg(conn, wid, "AI 已生成 N06 初稿（预算意见/ROI计算），请财务部确认生效。", _fts(1, 9))
+    _flow_msg(conn, wid, "杨思严 已确认 N06（审核预算·ROI测算）生效，产出：预算意见/ROI计算。", _fts(1, 10))
+    _set_node(conn, fid, "N07", "已完成", _fts(1, 11), _fts(1, 14), "马进军确认生效")
+    _flow_msg(conn, wid, "AI 已生成 N07 初稿（立项书/章程/RACI），请PMO确认生效。", _fts(1, 11))
+    _flow_msg(conn, wid, "马进军 已确认 N07（立项发起组织·等级评审·组建团队）生效，产出：立项书/章程/RACI。", _fts(1, 14))
+    _set_node(conn, fid, "N08", "待签核", _fts(1, 14), None, None)
+    _set_gate(conn, fid, "G1", "待签核")
+    _flow_msg(conn, wid, "阶段一「项目启动」主链路节点全部完成，阶段门 G1（N08 审批立项·确定等级）已开启，请咨询委/决策层签核。未过门禁不得进入下一阶段。", _fts(1, 14))
+
+
+def run_flow_seed(conn) -> bool:
+    """流程引擎演示数据：为 2 个已立项试点工作区预建 flow 并推进到不同阶段。
+    用 settings.flow_seeded 标记只跑一次；老库迁移时补播（建表 DDL 幂等）。
+    返回是否执行了播种。"""
+    if conn.execute("SELECT value FROM settings WHERE key='flow_seeded'").fetchone():
+        return False
+    from app import flow as flow_engine
+
+    demos = [("外贸订单跟单自动化", 20, _demo_flow_stage3),
+             ("会议纪要与待办闭环", 3, _demo_flow_gate1)]
+    built = 0
+    for sc_name, days_ago, builder in demos:
+        sc = conn.execute("SELECT * FROM scenarios WHERE name=?", (sc_name,)).fetchone()
+        if not sc:
+            continue
+        if conn.execute("SELECT id FROM project_flows WHERE scenario_id=?", (sc["id"],)).fetchone():
+            continue  # 已有流程，避免重复实例化
+        ws = conn.execute(
+            "SELECT * FROM workspaces WHERE scenario_id=? AND type='项目' ORDER BY id LIMIT 1",
+            (sc["id"],)).fetchone()
+        if not ws:
+            continue
+        fid = flow_engine.instantiate(conn, sc["id"], ws["id"], sc_name)
+        conn.execute("UPDATE project_flows SET created_at=? WHERE id=?", (_fts(days_ago), fid))
+        builder(conn, fid, ws["id"])
+        built += 1
+
+    conn.execute("INSERT INTO settings(key,value) VALUES('flow_seeded','1')")
+    conn.execute("INSERT INTO audits(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)",
+                 ("系统", "流程演示数据播种", "project_flows",
+                  f"预建 {built} 个演示流程（外贸→阶段三 / 会议纪要→G1待签核）", _now()))
+    conn.commit()
+    return built > 0
