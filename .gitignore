@@ -1,6 +1,8 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
 
 # 运行时数据（数据库/日志/上传产物，首次启动自动重建）
 agent-platform/data/*.db
@@ -19,6 +21,11 @@ multica-platform/data/*.db-wal
 multica-platform/data/*.db-shm
 multica-platform/data/**/*.db*
 multica-platform/data/*.log
+a2a-platform/data/*.db
+a2a-platform/data/*.db-journal
+a2a-platform/data/*.db-wal
+a2a-platform/data/*.db-shm
+a2a-platform/data/*.log
 
 # 验收截图（报告 md 保留，图片不入库）
 agent-platform/acceptance/shots/
